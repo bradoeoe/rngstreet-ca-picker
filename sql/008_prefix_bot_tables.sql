@@ -1,0 +1,1 @@
+-- Applied by rng_ca_bot.db.Database._apply_prefix_table_migration

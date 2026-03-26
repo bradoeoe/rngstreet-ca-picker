@@ -13,6 +13,29 @@ from .config import Settings
 
 LOGGER = logging.getLogger(__name__)
 
+SCHEMA_MIGRATIONS_TABLE = "ca_schema_migrations"
+LEGACY_SCHEMA_MIGRATIONS_TABLE = "schema_migrations"
+SCAN_RUNS_TABLE = "ca_scan_runs"
+PLAYER_SNAPSHOTS_TABLE = "ca_player_snapshots"
+TASK_CATALOG_TABLE = "ca_task_catalog"
+PROGRESS_TABLE = "ca_progress"
+TASK_CLAIMS_TABLE = "ca_task_claims"
+BOT_PANELS_TABLE = "ca_bot_panels"
+ACTIVE_TASKS_TABLE = "ca_user_active_tasks"
+USER_TASK_PROFILES_TABLE = "ca_user_task_profiles"
+BOSS_COMPLETION_REWARDS_TABLE = "ca_boss_completion_reroll_rewards"
+RSN_TIER_REWARDS_TABLE = "ca_rsn_tier_rewards"
+
+PREFIX_RENAMES: tuple[tuple[str, str], ...] = (
+    ("scan_runs", SCAN_RUNS_TABLE),
+    ("player_snapshots", PLAYER_SNAPSHOTS_TABLE),
+    ("task_claims", TASK_CLAIMS_TABLE),
+    ("bot_panels", BOT_PANELS_TABLE),
+    ("user_active_tasks", ACTIVE_TASKS_TABLE),
+    ("user_task_profiles", USER_TASK_PROFILES_TABLE),
+    ("boss_completion_reroll_rewards", BOSS_COMPLETION_REWARDS_TABLE),
+)
+
 
 @dataclass(slots=True)
 class TaskCatalogEntry:
@@ -54,16 +77,8 @@ class Database:
             conn.start_transaction()
             try:
                 cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS schema_migrations (
-                        version VARCHAR(64) NOT NULL PRIMARY KEY,
-                        applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                    """
-                )
-
-                cursor.execute("SELECT version FROM schema_migrations")
+                self._ensure_schema_migrations_table(cursor)
+                cursor.execute(f"SELECT version FROM {SCHEMA_MIGRATIONS_TABLE}")
                 applied = {row[0] for row in cursor.fetchall()}
 
                 sql_files = sorted(migrations_dir.glob("*.sql"))
@@ -73,12 +88,15 @@ class Database:
                         continue
 
                     LOGGER.info("Applying migration %s", version)
-                    sql_text = path.read_text(encoding="utf-8")
-                    for statement in _split_sql_statements(sql_text):
-                        cursor.execute(statement)
+                    if version == "008_prefix_bot_tables":
+                        self._apply_prefix_table_migration(cursor)
+                    else:
+                        sql_text = path.read_text(encoding="utf-8")
+                        for statement in _split_sql_statements(sql_text):
+                            cursor.execute(statement)
 
                     cursor.execute(
-                        "INSERT INTO schema_migrations (version) VALUES (%s)",
+                        f"INSERT INTO {SCHEMA_MIGRATIONS_TABLE} (version) VALUES (%s)",
                         (version,),
                     )
 
@@ -86,6 +104,52 @@ class Database:
             except Exception:
                 conn.rollback()
                 raise
+
+    def _ensure_schema_migrations_table(self, cursor) -> None:
+        if self._table_exists(cursor, SCHEMA_MIGRATIONS_TABLE):
+            return
+
+        if self._table_exists(cursor, LEGACY_SCHEMA_MIGRATIONS_TABLE):
+            cursor.execute(
+                f"RENAME TABLE {LEGACY_SCHEMA_MIGRATIONS_TABLE} TO {SCHEMA_MIGRATIONS_TABLE}"
+            )
+            return
+
+        cursor.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {SCHEMA_MIGRATIONS_TABLE} (
+                version VARCHAR(64) NOT NULL PRIMARY KEY,
+                applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+
+    def _apply_prefix_table_migration(self, cursor) -> None:
+        for old_name, new_name in PREFIX_RENAMES:
+            old_exists = self._table_exists(cursor, old_name)
+            new_exists = self._table_exists(cursor, new_name)
+            if old_exists and not new_exists:
+                LOGGER.info("Renaming table %s to %s", old_name, new_name)
+                cursor.execute(f"RENAME TABLE {old_name} TO {new_name}")
+            elif old_exists and new_exists:
+                LOGGER.warning(
+                    "Legacy table %s and new table %s both exist; leaving both in place",
+                    old_name,
+                    new_name,
+                )
+
+    def _table_exists(self, cursor, table_name: str) -> bool:
+        cursor.execute(
+            """
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = DATABASE()
+              AND table_name = %s
+            LIMIT 1
+            """,
+            (table_name,),
+        )
+        return cursor.fetchone() is not None
 
     def fetch_rsns(self, conn: MySQLConnection) -> list[str]:
         if not self._settings.user_source_sql.strip():
@@ -176,11 +240,58 @@ class Database:
         rsns = self.get_rsns_for_discord_user(conn, discord_user_id)
         return rsns[0] if rsns else None
 
+    def get_primary_discord_user_id_for_rsn(self, conn: MySQLConnection, rsn: str) -> str | None:
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute(
+                """
+                SELECT DISCORD_ID
+                FROM members
+                WHERE RSN = %s
+                  AND TRIM(COALESCE(DISCORD_ID, '')) <> ''
+                ORDER BY CASE WHEN COALESCE(MAIN_WOM_ID, 0) = 0 THEN 0 ELSE 1 END, WOM_ID
+                LIMIT 1
+                """,
+                (rsn,),
+            )
+            row = cursor.fetchone()
+            if row and row[0] is not None:
+                discord_user_id = str(row[0]).strip()
+                if discord_user_id:
+                    return discord_user_id
+        except mysql.connector.Error:
+            LOGGER.warning("Could not resolve Discord ID via members table for rsn %s", rsn)
+
+        try:
+            cursor.execute(
+                """
+                SELECT map.DISCORD_ID
+                FROM members m
+                JOIN main_rsn_map map
+                  ON map.WOM_ID = m.WOM_ID
+                WHERE m.RSN = %s
+                  AND TRIM(COALESCE(map.DISCORD_ID, '')) <> ''
+                ORDER BY m.WOM_ID
+                LIMIT 1
+                """,
+                (rsn,),
+            )
+            row = cursor.fetchone()
+            if row and row[0] is not None:
+                discord_user_id = str(row[0]).strip()
+                if discord_user_id:
+                    return discord_user_id
+        except mysql.connector.Error:
+            LOGGER.warning("Could not resolve Discord ID via main_rsn_map for rsn %s", rsn)
+
+        return None
+
     def create_scan_run(self, conn: MySQLConnection, trigger_source: str, total_users: int) -> int:
         cursor = conn.cursor()
         cursor.execute(
-            """
-            INSERT INTO scan_runs (trigger_source, status, total_users)
+            f"""
+            INSERT INTO {SCAN_RUNS_TABLE} (trigger_source, status, total_users)
             VALUES (%s, 'running', %s)
             """,
             (trigger_source, total_users),
@@ -198,8 +309,8 @@ class Database:
     ) -> None:
         cursor = conn.cursor()
         cursor.execute(
-            """
-            UPDATE scan_runs
+            f"""
+            UPDATE {SCAN_RUNS_TABLE}
             SET status = %s,
                 completed_at = CURRENT_TIMESTAMP,
                 success_users = %s,
@@ -220,8 +331,8 @@ class Database:
     ) -> None:
         cursor = conn.cursor()
         cursor.execute(
-            """
-            INSERT INTO player_snapshots (scan_run_id, rsn, source_timestamp, payload_json)
+            f"""
+            INSERT INTO {PLAYER_SNAPSHOTS_TABLE} (scan_run_id, rsn, source_timestamp, payload_json)
             VALUES (%s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
                 source_timestamp = VALUES(source_timestamp),
@@ -253,8 +364,8 @@ class Database:
 
         cursor = conn.cursor()
         cursor.executemany(
-            """
-            INSERT INTO ca_task_catalog (
+            f"""
+            INSERT INTO {TASK_CATALOG_TABLE} (
                 task_id,
                 task_name,
                 description,
@@ -284,13 +395,13 @@ class Database:
 
     def get_catalog_task_ids(self, conn: MySQLConnection) -> list[int]:
         cursor = conn.cursor()
-        cursor.execute("SELECT task_id FROM ca_task_catalog ORDER BY task_id")
+        cursor.execute(f"SELECT task_id FROM {TASK_CATALOG_TABLE} ORDER BY task_id")
         return [int(row[0]) for row in cursor.fetchall()]
 
     def get_task_metadata(self, conn: MySQLConnection, task_id: int) -> dict | None:
         cursor = conn.cursor(dictionary=True)
         cursor.execute(
-            """
+            f"""
             SELECT
                 task_id,
                 task_name,
@@ -301,7 +412,7 @@ class Database:
                 task_type,
                 tier_label,
                 points
-            FROM ca_task_catalog
+            FROM {TASK_CATALOG_TABLE}
             WHERE task_id = %s
             """,
             (task_id,),
@@ -325,7 +436,7 @@ class Database:
                 task_type,
                 tier_label,
                 points
-            FROM ca_task_catalog
+            FROM {TASK_CATALOG_TABLE}
             WHERE task_id IN ({placeholders})
             """,
             tuple(int(task_id) for task_id in task_ids),
@@ -336,9 +447,9 @@ class Database:
     def get_task_completion_state(self, conn: MySQLConnection, rsn: str, task_id: int) -> bool | None:
         cursor = conn.cursor()
         cursor.execute(
-            """
+            f"""
             SELECT is_complete
-            FROM ca_progress
+            FROM {PROGRESS_TABLE}
             WHERE rsn = %s
               AND task_id = %s
             """,
@@ -375,8 +486,8 @@ class Database:
 
         cursor = conn.cursor()
         cursor.executemany(
-            """
-            INSERT INTO ca_progress (rsn, task_id, is_complete, source, source_scan_run_id)
+            f"""
+            INSERT INTO {PROGRESS_TABLE} (rsn, task_id, is_complete, source, source_scan_run_id)
             VALUES (%s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
                 is_complete = VALUES(is_complete),
@@ -398,8 +509,8 @@ class Database:
     ) -> None:
         cursor = conn.cursor()
         cursor.execute(
-            """
-            INSERT INTO ca_progress (rsn, task_id, is_complete, source, source_scan_run_id)
+            f"""
+            INSERT INTO {PROGRESS_TABLE} (rsn, task_id, is_complete, source, source_scan_run_id)
             VALUES (%s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
                 is_complete = VALUES(is_complete),
@@ -412,7 +523,7 @@ class Database:
 
     def get_latest_completed_scan_run_id(self, conn: MySQLConnection) -> int | None:
         cursor = conn.cursor()
-        cursor.execute("SELECT MAX(id) FROM scan_runs WHERE status = 'completed'")
+        cursor.execute(f"SELECT MAX(id) FROM {SCAN_RUNS_TABLE} WHERE status = 'completed'")
         row = cursor.fetchone()
         if not row or row[0] is None:
             return None
@@ -421,7 +532,7 @@ class Database:
     def get_incomplete_task_ids(self, conn: MySQLConnection, rsn: str) -> set[int]:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT task_id FROM ca_progress WHERE rsn = %s AND is_complete = 0",
+            f"SELECT task_id FROM {PROGRESS_TABLE} WHERE rsn = %s AND is_complete = 0",
             (rsn,),
         )
         return {int(row[0]) for row in cursor.fetchall()}
@@ -438,9 +549,9 @@ class Database:
 
         cursor = conn.cursor()
         cursor.execute(
-            """
+            f"""
             SELECT task_id
-            FROM task_claims
+            FROM {TASK_CLAIMS_TABLE}
             WHERE discord_user_id = %s
               AND rsn = %s
               AND claim_scan_run_id = %s
@@ -449,6 +560,73 @@ class Database:
             (discord_user_id, rsn, scan_run_id),
         )
         return {int(row[0]) for row in cursor.fetchall()}
+
+    def ensure_user_task_profile(self, conn: MySQLConnection, discord_user_id: str) -> None:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            INSERT IGNORE INTO {USER_TASK_PROFILES_TABLE} (discord_user_id)
+            VALUES (%s)
+            """,
+            (discord_user_id,),
+        )
+
+    def get_user_task_profile(
+        self,
+        conn: MySQLConnection,
+        discord_user_id: str,
+        *,
+        for_update: bool = False,
+    ) -> dict:
+        self.ensure_user_task_profile(conn, discord_user_id)
+        cursor = conn.cursor(dictionary=True)
+        query = """
+            SELECT discord_user_id, rerolls_available, completion_reward_batches, created_at, updated_at
+            FROM {USER_TASK_PROFILES_TABLE}
+            WHERE discord_user_id = %s
+        """
+        query = query.format(USER_TASK_PROFILES_TABLE=USER_TASK_PROFILES_TABLE)
+        if for_update:
+            query += " FOR UPDATE"
+        cursor.execute(query, (discord_user_id,))
+        row = cursor.fetchone()
+        if row is None:
+            raise RuntimeError(f"Could not load task profile for Discord user {discord_user_id}")
+        return row
+
+    def update_user_task_profile(
+        self,
+        conn: MySQLConnection,
+        discord_user_id: str,
+        *,
+        rerolls_available: int | None = None,
+        completion_reward_batches: int | None = None,
+    ) -> None:
+        assignments: list[str] = []
+        values: list[int | str] = []
+
+        if rerolls_available is not None:
+            assignments.append("rerolls_available = %s")
+            values.append(int(rerolls_available))
+        if completion_reward_batches is not None:
+            assignments.append("completion_reward_batches = %s")
+            values.append(int(completion_reward_batches))
+
+        if not assignments:
+            return
+
+        assignments.append("updated_at = CURRENT_TIMESTAMP")
+        values.append(discord_user_id)
+
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            UPDATE {USER_TASK_PROFILES_TABLE}
+            SET {", ".join(assignments)}
+            WHERE discord_user_id = %s
+            """,
+            tuple(values),
+        )
 
     def mark_task_claimed_complete(
         self,
@@ -463,8 +641,8 @@ class Database:
     ) -> None:
         cursor = conn.cursor()
         cursor.execute(
-            """
-            INSERT INTO task_claims (
+            f"""
+            INSERT INTO {TASK_CLAIMS_TABLE} (
                 discord_user_id,
                 rsn,
                 task_id,
@@ -494,12 +672,26 @@ class Database:
         task_id: int,
         is_complete: bool,
         verified_scan_run_id: int | None,
-    ) -> str:
+    ) -> tuple[str | None, str]:
         new_status = "verified_complete" if is_complete else "corrected_incomplete"
         cursor = conn.cursor()
         cursor.execute(
-            """
-            INSERT INTO task_claims (
+            f"""
+            SELECT status
+            FROM {TASK_CLAIMS_TABLE}
+            WHERE discord_user_id = %s
+              AND rsn = %s
+              AND task_id = %s
+            """,
+            (discord_user_id, rsn, task_id),
+        )
+        row = cursor.fetchone()
+        previous_status = str(row[0]) if row and row[0] is not None else None
+
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            INSERT INTO {TASK_CLAIMS_TABLE} (
                 discord_user_id,
                 rsn,
                 task_id,
@@ -524,7 +716,7 @@ class Database:
                 verified_scan_run_id,
             ),
         )
-        return new_status
+        return previous_status, new_status
 
     def reconcile_claims_with_scan(
         self,
@@ -532,12 +724,12 @@ class Database:
         rsn: str,
         completed_task_ids: set[int],
         scan_run_id: int,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, list[tuple[str, int]]]:
         cursor = conn.cursor()
         cursor.execute(
-            """
-            SELECT id, task_id, status
-            FROM task_claims
+            f"""
+            SELECT id, discord_user_id, task_id, status
+            FROM {TASK_CLAIMS_TABLE}
             WHERE rsn = %s
             """,
             (rsn,),
@@ -545,7 +737,8 @@ class Database:
 
         verified = 0
         corrected = 0
-        for claim_id, task_id, _status in cursor.fetchall():
+        newly_verified_claims: list[tuple[str, int]] = []
+        for claim_id, discord_user_id, task_id, current_status in cursor.fetchall():
             task_id = int(task_id)
             is_complete = task_id in completed_task_ids
             next_status = "verified_complete" if is_complete else "corrected_incomplete"
@@ -555,8 +748,8 @@ class Database:
                 corrected += 1
 
             cursor.execute(
-                """
-                UPDATE task_claims
+                f"""
+                UPDATE {TASK_CLAIMS_TABLE}
                 SET status = %s,
                     verified_scan_run_id = %s,
                     last_verified_at = CURRENT_TIMESTAMP,
@@ -566,13 +759,166 @@ class Database:
                 (next_status, scan_run_id, claim_id),
             )
 
-        return verified, corrected
+            if next_status == "verified_complete" and current_status != "verified_complete":
+                newly_verified_claims.append((str(discord_user_id), task_id))
+
+        return verified, corrected, newly_verified_claims
+
+    def count_verified_task_claims(self, conn: MySQLConnection, discord_user_id: str) -> int:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM {TASK_CLAIMS_TABLE}
+            WHERE discord_user_id = %s
+              AND status = 'verified_complete'
+            """,
+            (discord_user_id,),
+        )
+        row = cursor.fetchone()
+        return int(row[0] or 0) if row else 0
+
+    def get_task_claim_counts_for_user(self, conn: MySQLConnection, discord_user_id: str) -> dict[str, int]:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT status, COUNT(*)
+            FROM {TASK_CLAIMS_TABLE}
+            WHERE discord_user_id = %s
+            GROUP BY status
+            """,
+            (discord_user_id,),
+        )
+        counts = {
+            "verified_complete": 0,
+            "claimed_complete": 0,
+            "corrected_incomplete": 0,
+        }
+        for status, count in cursor.fetchall():
+            key = str(status or "").strip()
+            counts[key] = int(count or 0)
+        return counts
+
+    def get_verified_task_claim_counts_by_rsn(self, conn: MySQLConnection, discord_user_id: str) -> dict[str, int]:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT rsn, COUNT(*)
+            FROM {TASK_CLAIMS_TABLE}
+            WHERE discord_user_id = %s
+              AND status = 'verified_complete'
+            GROUP BY rsn
+            ORDER BY rsn
+            """,
+            (discord_user_id,),
+        )
+        counts: dict[str, int] = {}
+        for rsn, count in cursor.fetchall():
+            rsn_value = str(rsn or "").strip()
+            if not rsn_value:
+                continue
+            counts[rsn_value] = int(count or 0)
+        return counts
+
+    def record_boss_completion_reroll_reward(
+        self,
+        conn: MySQLConnection,
+        discord_user_id: str,
+        rsn: str,
+        npc: str,
+        rewarded_task_id: int,
+    ) -> bool:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            INSERT IGNORE INTO {BOSS_COMPLETION_REWARDS_TABLE} (
+                discord_user_id,
+                rsn,
+                npc,
+                rewarded_task_id
+            )
+            VALUES (%s, %s, %s, %s)
+            """,
+            (discord_user_id, rsn, npc, rewarded_task_id),
+        )
+        return cursor.rowcount > 0
+
+    def ensure_rsn_tier_reward_state(self, conn: MySQLConnection, rsn: str) -> None:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            INSERT IGNORE INTO {RSN_TIER_REWARDS_TABLE} (rsn)
+            VALUES (%s)
+            """,
+            (rsn,),
+        )
+
+    def get_rsn_tier_reward_state(
+        self,
+        conn: MySQLConnection,
+        rsn: str,
+        *,
+        for_update: bool = False,
+    ) -> dict:
+        self.ensure_rsn_tier_reward_state(conn, rsn)
+        cursor = conn.cursor(dictionary=True)
+        query = """
+            SELECT rsn, highest_rewarded_tier_rank, highest_rewarded_tier_label, updated_at
+            FROM {RSN_TIER_REWARDS_TABLE}
+            WHERE rsn = %s
+        """
+        query = query.format(RSN_TIER_REWARDS_TABLE=RSN_TIER_REWARDS_TABLE)
+        if for_update:
+            query += " FOR UPDATE"
+        cursor.execute(query, (rsn,))
+        row = cursor.fetchone()
+        if row is None:
+            raise RuntimeError(f"Could not load rsn tier reward state for {rsn}")
+        return row
+
+    def update_rsn_tier_reward_state(
+        self,
+        conn: MySQLConnection,
+        rsn: str,
+        *,
+        highest_rewarded_tier_rank: int,
+        highest_rewarded_tier_label: str | None,
+    ) -> None:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            UPDATE {RSN_TIER_REWARDS_TABLE}
+            SET highest_rewarded_tier_rank = %s,
+                highest_rewarded_tier_label = %s,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE rsn = %s
+            """,
+            (int(highest_rewarded_tier_rank), highest_rewarded_tier_label, rsn),
+        )
+
+    def get_catalog_point_totals_by_tier(self, conn: MySQLConnection) -> dict[str, int]:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT tier_label, SUM(COALESCE(points, 0)) AS tier_points
+            FROM {TASK_CATALOG_TABLE}
+            WHERE TRIM(COALESCE(tier_label, '')) <> ''
+            GROUP BY tier_label
+            """,
+        )
+        totals: dict[str, int] = {}
+        for tier_label, tier_points in cursor.fetchall():
+            label = str(tier_label or "").strip()
+            if not label:
+                continue
+            totals[label] = int(tier_points or 0)
+        return totals
 
     def ensure_task_stub(self, conn: MySQLConnection, task_id: int, source_url: str) -> None:
         cursor = conn.cursor()
         cursor.execute(
-            """
-            INSERT IGNORE INTO ca_task_catalog (task_id, task_name, source_url)
+            f"""
+            INSERT IGNORE INTO {TASK_CATALOG_TABLE} (task_id, task_name, source_url)
             VALUES (%s, %s, %s)
             """,
             (task_id, f"Task {task_id}", source_url),
@@ -581,9 +927,9 @@ class Database:
     def get_latest_snapshot(self, conn: MySQLConnection, rsn: str) -> dict | None:
         cursor = conn.cursor(dictionary=True)
         cursor.execute(
-            """
+            f"""
             SELECT id, scan_run_id, rsn, source_timestamp, fetched_at, payload_json
-            FROM player_snapshots
+            FROM {PLAYER_SNAPSHOTS_TABLE}
             WHERE rsn = %s
             ORDER BY fetched_at DESC
             LIMIT 1
@@ -595,29 +941,33 @@ class Database:
     def get_progress_summary(self, conn: MySQLConnection, rsn: str) -> dict[str, int]:
         cursor = conn.cursor()
         cursor.execute(
-            """
+            f"""
             SELECT
-                SUM(CASE WHEN is_complete = 1 THEN 1 ELSE 0 END) AS completed_count,
-                SUM(CASE WHEN is_complete = 0 THEN 1 ELSE 0 END) AS incomplete_count
-            FROM ca_progress
+                SUM(CASE WHEN progress.is_complete = 1 THEN 1 ELSE 0 END) AS completed_count,
+                SUM(CASE WHEN progress.is_complete = 0 THEN 1 ELSE 0 END) AS incomplete_count,
+                SUM(CASE WHEN progress.is_complete = 1 THEN COALESCE(catalog.points, 0) ELSE 0 END) AS total_points
+            FROM {PROGRESS_TABLE} AS progress
+            LEFT JOIN {TASK_CATALOG_TABLE} AS catalog
+              ON catalog.task_id = progress.task_id
             WHERE rsn = %s
             """,
             (rsn,),
         )
         row = cursor.fetchone()
         if not row:
-            return {"completed_count": 0, "incomplete_count": 0}
+            return {"completed_count": 0, "incomplete_count": 0, "total_points": 0}
         return {
             "completed_count": int(row[0] or 0),
             "incomplete_count": int(row[1] or 0),
+            "total_points": int(row[2] or 0),
         }
 
     def get_bot_panel(self, conn: MySQLConnection, panel_key: str) -> dict | None:
         cursor = conn.cursor(dictionary=True)
         cursor.execute(
-            """
+            f"""
             SELECT panel_key, guild_id, channel_id, message_id, created_at, updated_at
-            FROM bot_panels
+            FROM {BOT_PANELS_TABLE}
             WHERE panel_key = %s
             """,
             (panel_key,),
@@ -634,8 +984,8 @@ class Database:
     ) -> None:
         cursor = conn.cursor()
         cursor.execute(
-            """
-            INSERT INTO bot_panels (panel_key, guild_id, channel_id, message_id)
+            f"""
+            INSERT INTO {BOT_PANELS_TABLE} (panel_key, guild_id, channel_id, message_id)
             VALUES (%s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
                 guild_id = VALUES(guild_id),
@@ -649,9 +999,9 @@ class Database:
     def get_active_task(self, conn: MySQLConnection, discord_user_id: str, rsn: str) -> dict | None:
         cursor = conn.cursor(dictionary=True)
         cursor.execute(
-            """
+            f"""
             SELECT discord_user_id, rsn, task_id, assigned_scan_run_id, created_at, updated_at
-            FROM user_active_tasks
+            FROM {ACTIVE_TASKS_TABLE}
             WHERE discord_user_id = %s
               AND rsn = %s
             """,
@@ -662,9 +1012,9 @@ class Database:
     def get_active_tasks(self, conn: MySQLConnection, discord_user_id: str) -> list[dict]:
         cursor = conn.cursor(dictionary=True)
         cursor.execute(
-            """
+            f"""
             SELECT discord_user_id, rsn, task_id, assigned_scan_run_id, created_at, updated_at
-            FROM user_active_tasks
+            FROM {ACTIVE_TASKS_TABLE}
             WHERE discord_user_id = %s
             ORDER BY updated_at DESC
             """,
@@ -682,8 +1032,8 @@ class Database:
     ) -> None:
         cursor = conn.cursor()
         cursor.execute(
-            """
-            INSERT INTO user_active_tasks (discord_user_id, rsn, task_id, assigned_scan_run_id)
+            f"""
+            INSERT INTO {ACTIVE_TASKS_TABLE} (discord_user_id, rsn, task_id, assigned_scan_run_id)
             VALUES (%s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
                 rsn = VALUES(rsn),
@@ -697,8 +1047,8 @@ class Database:
     def clear_active_task(self, conn: MySQLConnection, discord_user_id: str, rsn: str) -> None:
         cursor = conn.cursor()
         cursor.execute(
-            """
-            DELETE FROM user_active_tasks
+            f"""
+            DELETE FROM {ACTIVE_TASKS_TABLE}
             WHERE discord_user_id = %s
               AND rsn = %s
             """,

@@ -11,18 +11,20 @@ from discord.ext import commands
 
 from .config import Settings
 from .db import ScanRunResult
-from .sync_service import ActiveTaskAssignment, RandomTaskResult, SyncService
+from .sync_service import ActiveTaskAssignment, RandomTaskResult, SyncService, UserTaskProfileSummary
 
 LOGGER = logging.getLogger(__name__)
 
 PANEL_KEY = "global_task_panel"
 GET_TASK_CUSTOM_ID = "rngca:panel:get_task"
-TOO_HARD_CUSTOM_ID = "rngca:panel:too_hard"
+REROLL_CUSTOM_ID = "rngca:panel:reroll"
 COMPLETE_TASK_CUSTOM_ID = "rngca:panel:complete_task"
+PROFILE_CUSTOM_ID = "rngca:panel:profile"
 
 ACTION_GET = "get_task"
-ACTION_TOO_HARD = "too_hard"
+ACTION_REROLL = "reroll"
 ACTION_COMPLETE = "complete_task"
+ACTION_PROFILE = "profile"
 
 
 @dataclass(slots=True)
@@ -98,8 +100,9 @@ def _panel_embed() -> discord.Embed:
         description=(
             "Grab a random CA and send it.\n"
             "**Get Task** = pull your active task.\n"
-            "**Too Hard** = reroll to a lower-point task for that account.\n"
-            "**Complete Task** = claim completion."
+            "**Reroll** = spend 1 reroll for a fresh assigned task.\n"
+            "**Complete Task** = claim completion and trigger a live verification check.\n"
+            "**Profile** = view your rerolls, completed tasks per account, and active accounts."
         ),
         color=discord.Color.gold(),
     )
@@ -108,11 +111,52 @@ def _panel_embed() -> discord.Embed:
 def _action_human_name(action: str) -> str:
     if action == ACTION_GET:
         return "Get Task"
-    if action == ACTION_TOO_HARD:
-        return "Too Hard"
+    if action == ACTION_REROLL:
+        return "Reroll"
     if action == ACTION_COMPLETE:
         return "Complete Task"
+    if action == ACTION_PROFILE:
+        return "Profile"
     return "Task Action"
+
+
+def _profile_embed(profile: UserTaskProfileSummary) -> discord.Embed:
+    embed = discord.Embed(
+        title="Task Profile",
+        description="Your CA challenge progress across bot-assigned tasks.",
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(UTC),
+    )
+    embed.add_field(name="Rerolls", value=f"**{profile.rerolls_available}**", inline=True)
+
+    if profile.completed_tasks_by_account:
+        completed_lines = [
+            f"`{account.rsn}`: **{account.completed_tasks}** bot tasks | **{account.total_points} pts**"
+            for account in profile.completed_tasks_by_account
+        ]
+        embed.add_field(
+            name="Account Progress",
+            value=_truncate_text("\n".join(completed_lines), 1024),
+            inline=False,
+        )
+    else:
+        embed.add_field(name="Account Progress", value="No account progress found yet.", inline=False)
+
+    if profile.active_tasks:
+        active_lines = [
+            f"`{active.rsn}`: {active.task.task_name} (`ID {active.task.task_id}`)"
+            for active in profile.active_tasks
+        ]
+        embed.add_field(
+            name="Active Accounts",
+            value=_truncate_text("\n".join(active_lines), 1024),
+            inline=False,
+        )
+    else:
+        embed.add_field(name="Active Accounts", value="None right now.", inline=False)
+
+    embed.set_footer(text="Combat Task Tracker")
+    return embed
 
 
 async def _send_ephemeral_followup(
@@ -203,25 +247,56 @@ async def _run_panel_action(
             )
             return
 
-        completed_rsn, task = completed
+        if completed.live_verified:
+            reward_line = ""
+            if completed.awarded_rerolls > 0:
+                reroll_label = "reroll" if completed.awarded_rerolls == 1 else "rerolls"
+                reward_line = (
+                    f" You earned **{completed.awarded_rerolls}** {reroll_label} and now have "
+                    f"**{completed.rerolls_remaining}** available."
+                )
+            else:
+                reward_line = f" You now have **{completed.rerolls_remaining}** rerolls available."
+
+            await _send_ephemeral_followup(
+                interaction,
+                content=(
+                    f"Verified completion for `{completed.rsn}`: **{completed.task.task_name}** "
+                    f"(`ID {completed.task.task_id}`).{reward_line} Click **Get Task** for your next one."
+                ),
+            )
+            return
+
+        if completed.live_verification_attempted:
+            await _send_ephemeral_followup(
+                interaction,
+                content=(
+                    f"Recorded completion claim for `{completed.rsn}`: **{completed.task.task_name}** "
+                    f"(`ID {completed.task.task_id}`). Live lookup did not confirm it yet, "
+                    "so it will be checked again during the next daily scan."
+                ),
+            )
+            return
+
         await _send_ephemeral_followup(
             interaction,
             content=(
-                f"Marked complete for `{completed_rsn}`: **{task.task_name}** (`ID {task.task_id}`). "
-                "Click **Get Task** for your next one."
+                f"Recorded completion claim for `{completed.rsn}`: **{completed.task.task_name}** "
+                f"(`ID {completed.task.task_id}`). Live verification was unavailable just now, "
+                "so the daily scan will reconcile it later."
             ),
         )
         return
 
-    if action == ACTION_TOO_HARD:
+    if action == ACTION_REROLL:
         try:
             result = await asyncio.to_thread(
-                bot.services.sync_service.reroll_active_task_too_hard,
+                bot.services.sync_service.reroll_active_task,
                 discord_user_id,
                 rsn,
             )
         except Exception:
-            LOGGER.exception("Too Hard reroll failed for user %s rsn %s", discord_user_id, rsn)
+            LOGGER.exception("Reroll failed for user %s rsn %s", discord_user_id, rsn)
             await _send_ephemeral_followup(
                 interaction,
                 content="Could not reroll right now. Please try again.",
@@ -236,30 +311,50 @@ async def _run_panel_action(
             return
 
         if result.replacement_task is None:
-            points = result.previous_task.points
-            if points is not None:
+            if result.rerolls_remaining <= 0:
                 await _send_ephemeral_followup(
                     interaction,
                     content=(
-                        f"No easier eligible task found under `{points}` points for `{rsn}`. "
-                        "Try completing this one or wait for the next scan cycle."
+                        f"You have no rerolls left for `{rsn}`. "
+                        "Click **Profile** to check your balance."
                     ),
                 )
-            else:
-                await _send_ephemeral_followup(
-                    interaction,
-                    content=f"No alternative eligible task found for `{rsn}` right now.",
-                )
+                return
+
+            await _send_ephemeral_followup(
+                interaction,
+                content=(
+                    f"No alternative eligible task found for `{rsn}` right now. "
+                    f"Your reroll was not spent. You still have **{result.rerolls_remaining}** available."
+                ),
+            )
             return
 
         await _send_ephemeral_followup(
             interaction,
             content=(
                 f"Rerolled `{rsn}` from **{result.previous_task.task_name}** "
-                f"to an easier task:"
+                f"to a new task. Rerolls left: **{result.rerolls_remaining}**."
             ),
             embed=_task_embed(rsn, result.replacement_task),
         )
+        return
+
+    if action == ACTION_PROFILE:
+        try:
+            profile = await asyncio.to_thread(
+                bot.services.sync_service.get_user_task_profile_summary,
+                discord_user_id,
+            )
+        except Exception:
+            LOGGER.exception("Profile lookup failed for user %s", discord_user_id)
+            await _send_ephemeral_followup(
+                interaction,
+                content="Could not load your task profile right now. Please try again.",
+            )
+            return
+
+        await _send_ephemeral_followup(interaction, embed=_profile_embed(profile))
         return
 
     await _send_ephemeral_followup(interaction, content="Unknown task action.")
@@ -311,6 +406,16 @@ class GlobalTaskPanelView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         discord_user_id = str(interaction.user.id)
 
+        if action == ACTION_PROFILE:
+            await _run_panel_action(
+                self.bot,
+                interaction,
+                action,
+                discord_user_id,
+                "",
+            )
+            return
+
         try:
             rsns = await asyncio.to_thread(
                 self.bot.services.sync_service.resolve_rsns_for_discord_user,
@@ -361,9 +466,9 @@ class GlobalTaskPanelView(discord.ui.View):
     async def get_task(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
         await self._start_action(interaction, ACTION_GET)
 
-    @discord.ui.button(label="Too Hard", style=discord.ButtonStyle.secondary, custom_id=TOO_HARD_CUSTOM_ID)
-    async def too_hard(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
-        await self._start_action(interaction, ACTION_TOO_HARD)
+    @discord.ui.button(label="Reroll", style=discord.ButtonStyle.secondary, custom_id=REROLL_CUSTOM_ID)
+    async def reroll(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        await self._start_action(interaction, ACTION_REROLL)
 
     @discord.ui.button(
         label="Complete Task",
@@ -372,6 +477,10 @@ class GlobalTaskPanelView(discord.ui.View):
     )
     async def complete_task(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
         await self._start_action(interaction, ACTION_COMPLETE)
+
+    @discord.ui.button(label="Profile", style=discord.ButtonStyle.secondary, custom_id=PROFILE_CUSTOM_ID)
+    async def profile(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        await self._start_action(interaction, ACTION_PROFILE)
 
 
 class RngCABot(commands.Bot):

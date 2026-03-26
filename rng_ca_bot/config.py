@@ -6,6 +6,15 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+DEFAULT_TIER_ASSIGNMENT_WEIGHTS: dict[str, int] = {
+    "easy": 12,
+    "medium": 9,
+    "hard": 6,
+    "elite": 4,
+    "master": 2,
+    "grandmaster": 1,
+}
+
 
 @dataclass(slots=True)
 class Settings:
@@ -22,6 +31,7 @@ class Settings:
     http_user_agent: str
     task_panel_channel_id: int | None
     log_level: str
+    tier_assignment_weights: dict[str, int]
 
     @property
     def db_settings(self) -> dict[str, Any]:
@@ -40,6 +50,36 @@ def _get_int(name: str, default: int) -> int:
     if raw is None or raw == "":
         return default
     return int(raw)
+
+
+def _parse_tier_assignment_weights(raw: str | None) -> dict[str, int]:
+    weights = dict(DEFAULT_TIER_ASSIGNMENT_WEIGHTS)
+    if raw is None or raw.strip() == "":
+        return weights
+
+    for entry in raw.split(","):
+        item = entry.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(
+                "TIER_ASSIGNMENT_WEIGHTS entries must look like 'easy=12,medium=9,...'",
+            )
+        tier_label, weight_text = item.split("=", 1)
+        tier_key = tier_label.strip().casefold()
+        if tier_key not in DEFAULT_TIER_ASSIGNMENT_WEIGHTS:
+            raise ValueError(f"Unknown tier in TIER_ASSIGNMENT_WEIGHTS: {tier_label!r}")
+        try:
+            weight_value = int(weight_text.strip())
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid weight for tier {tier_label!r}: {weight_text!r}",
+            ) from exc
+        if weight_value < 0:
+            raise ValueError(f"Tier weight must be >= 0 for {tier_label!r}")
+        weights[tier_key] = weight_value
+
+    return weights
 
 
 def load_settings() -> Settings:
@@ -67,4 +107,5 @@ def load_settings() -> Settings:
         http_user_agent=os.getenv("HTTP_USER_AGENT", "RNG-CA-Bot/1.0"),
         task_panel_channel_id=task_panel_channel_id,
         log_level=os.getenv("LOG_LEVEL", "INFO"),
+        tier_assignment_weights=_parse_tier_assignment_weights(os.getenv("TIER_ASSIGNMENT_WEIGHTS")),
     )

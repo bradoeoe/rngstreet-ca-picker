@@ -1,4 +1,4 @@
-CREATE TABLE IF NOT EXISTS bot_panels (
+CREATE TABLE IF NOT EXISTS ca_bot_panels (
   panel_key VARCHAR(64) NOT NULL PRIMARY KEY,
   guild_id VARCHAR(32) NULL,
   channel_id VARCHAR(32) NOT NULL,
@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS bot_panels (
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE IF NOT EXISTS user_active_tasks (
+CREATE TABLE IF NOT EXISTS ca_user_active_tasks (
   discord_user_id VARCHAR(32) NOT NULL PRIMARY KEY,
   rsn VARCHAR(32) NOT NULL,
   task_id INT NOT NULL,
@@ -21,6 +21,6 @@ CREATE TABLE IF NOT EXISTS user_active_tasks (
     FOREIGN KEY (task_id) REFERENCES ca_task_catalog(task_id)
     ON DELETE CASCADE,
   CONSTRAINT fk_active_scan_run
-    FOREIGN KEY (assigned_scan_run_id) REFERENCES scan_runs(id)
+    FOREIGN KEY (assigned_scan_run_id) REFERENCES ca_scan_runs(id)
     ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

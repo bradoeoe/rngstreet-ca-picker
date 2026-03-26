@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from html import unescape
-from typing import Iterable
+from typing import Iterable, Mapping
 from urllib.parse import quote
 
 import requests
@@ -25,6 +25,15 @@ _TD_PATTERN = re.compile(r"<td[^>]*>(.*?)</td>", re.DOTALL | re.IGNORECASE)
 _TAG_PATTERN = re.compile(r"<[^>]+>")
 _HREF_PATTERN = re.compile(r'<a[^>]*href="([^"]+)"', re.IGNORECASE)
 _POINTS_PATTERN = re.compile(r"\((\d+)\s*pt")
+_TIER_ORDER: tuple[tuple[str, str], ...] = (
+    ("easy", "Easy"),
+    ("medium", "Medium"),
+    ("hard", "Hard"),
+    ("elite", "Elite"),
+    ("master", "Master"),
+    ("grandmaster", "Grandmaster"),
+)
+_TIER_RANKS: dict[str, int] = {tier_key: rank for rank, (tier_key, _label) in enumerate(_TIER_ORDER, start=1)}
 
 
 @dataclass(slots=True)
@@ -49,10 +58,51 @@ class ActiveTaskAssignment:
 
 
 @dataclass(slots=True)
-class TooHardResult:
+class RerollResult:
     rsn: str
     previous_task: RandomTaskResult
     replacement_task: RandomTaskResult | None
+    rerolls_remaining: int
+
+
+@dataclass(slots=True)
+class CompletionResult:
+    rsn: str
+    task: RandomTaskResult
+    rerolls_remaining: int
+    awarded_rerolls: int
+    verified_assigned_completions: int
+    live_verification_attempted: bool
+    live_verified: bool
+
+
+@dataclass(slots=True)
+class ActiveTaskSummary:
+    rsn: str
+    task: RandomTaskResult
+
+
+@dataclass(slots=True)
+class AccountCompletedTasksSummary:
+    rsn: str
+    completed_tasks: int
+    total_points: int
+
+
+@dataclass(slots=True)
+class UserTaskProfileSummary:
+    discord_user_id: str
+    rerolls_available: int
+    completed_tasks_by_account: list[AccountCompletedTasksSummary]
+    active_tasks: list[ActiveTaskSummary]
+
+
+@dataclass(slots=True)
+class TierThreshold:
+    rank: int
+    key: str
+    label: str
+    required_points: int
 
 
 class RuneLiteSyncError(Exception):
@@ -187,6 +237,101 @@ def compute_eligible_task_ids(incomplete_ids: Iterable[int], claimed_ids_for_lat
     return eligible
 
 
+def _normalize_task_type(value: str | None) -> str:
+    if not value:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+
+def _npc_group_key(value: str | None) -> str:
+    if not value:
+        return ""
+    return " ".join(value.split()).casefold()
+
+
+def _normalize_tier_label(value: str | None) -> str:
+    if not value:
+        return ""
+    return " ".join(value.split()).casefold()
+
+
+def _tier_rank(value: str | None) -> int | None:
+    tier_key = _normalize_tier_label(value)
+    if not tier_key:
+        return None
+    return _TIER_RANKS.get(tier_key)
+
+
+def filter_reroll_candidate_ids(
+    current_task_id: int,
+    candidate_ids: Iterable[int],
+    metadata_by_id: Mapping[int, Mapping[str, object] | dict],
+) -> list[int]:
+    current_task_id = int(current_task_id)
+    candidates = [int(task_id) for task_id in candidate_ids if int(task_id) != current_task_id]
+    if not candidates:
+        return []
+
+    current_metadata = metadata_by_id.get(current_task_id) or {}
+    current_rank = _tier_rank(current_metadata.get("tier_label"))
+    if current_rank is not None:
+        lower_tier_candidates = [
+            candidate_id
+            for candidate_id in candidates
+            if (
+                (candidate_metadata := metadata_by_id.get(candidate_id) or {})
+                and (candidate_rank := _tier_rank(candidate_metadata.get("tier_label"))) is not None
+                and candidate_rank < current_rank
+            )
+        ]
+        if lower_tier_candidates:
+            return lower_tier_candidates
+
+    current_npc_key = _npc_group_key(current_metadata.get("npc"))
+    if current_npc_key:
+        different_boss_candidates = [
+            candidate_id
+            for candidate_id in candidates
+            if _npc_group_key((metadata_by_id.get(candidate_id) or {}).get("npc")) != current_npc_key
+        ]
+        if different_boss_candidates:
+            return different_boss_candidates
+
+    return candidates
+
+
+def filter_task_ids_by_tier_cap(
+    candidate_ids: Iterable[int],
+    metadata_by_id: Mapping[int, Mapping[str, object] | dict],
+    *,
+    current_tier_rank: int,
+    max_tiers_above: int = 3,
+) -> list[int]:
+    current_rank = max(int(current_tier_rank), 0)
+    max_allowed_rank = min(len(_TIER_ORDER), current_rank + max(0, int(max_tiers_above)))
+
+    filtered: list[int] = []
+    for candidate_id in candidate_ids:
+        task_id = int(candidate_id)
+        task_rank = _tier_rank((metadata_by_id.get(task_id) or {}).get("tier_label"))
+        if task_rank is not None and task_rank > max_allowed_rank:
+            continue
+        filtered.append(task_id)
+    return filtered
+
+
+def get_task_selection_weight(
+    task_id: int,
+    metadata_by_id: Mapping[int, Mapping[str, object] | dict],
+    tier_weights: Mapping[str, int],
+) -> int:
+    metadata = metadata_by_id.get(int(task_id)) or {}
+    tier_key = _normalize_tier_label(metadata.get("tier_label"))
+    if not tier_key:
+        return 1
+    return max(int(tier_weights.get(tier_key, 1)), 0)
+
+
 class SyncService:
     def __init__(self, settings: Settings, db: Database) -> None:
         self.settings = settings
@@ -227,6 +372,36 @@ class SyncService:
         if not isinstance(payload, dict):
             raise ValueError(f"Unexpected payload type for {rsn}: {type(payload)!r}")
         return payload
+
+    def _pick_weighted_task_id(
+        self,
+        conn,
+        candidate_ids: Iterable[int],
+    ) -> int:
+        candidates = [int(task_id) for task_id in candidate_ids]
+        if not candidates:
+            raise ValueError("Cannot pick a weighted task from an empty candidate list")
+
+        metadata_by_id = self.db.get_task_metadata_for_ids(conn, candidates)
+        weights = [
+            get_task_selection_weight(
+                task_id,
+                metadata_by_id,
+                self.settings.tier_assignment_weights,
+            )
+            for task_id in candidates
+        ]
+        total_weight = sum(weights)
+        if total_weight <= 0:
+            return self._rand.choice(candidates)
+
+        target = self._rand.randint(1, total_weight)
+        running_total = 0
+        for task_id, weight in zip(candidates, weights):
+            running_total += weight
+            if target <= running_total:
+                return task_id
+        return candidates[-1]
 
     def fetch_ca_catalog_entries(self) -> list[TaskCatalogEntry]:
         response = requests.get(
@@ -317,12 +492,30 @@ class SyncService:
                             source_scan_run_id=run_id,
                         )
 
-                        self.db.reconcile_claims_with_scan(
+                        _verified, _corrected, newly_verified_claims = self.db.reconcile_claims_with_scan(
                             conn,
                             rsn=rsn,
                             completed_task_ids=completed_ids,
                             scan_run_id=run_id,
                         )
+                        mapped_discord_user_id = self.db.get_primary_discord_user_id_for_rsn(conn, rsn)
+                        if mapped_discord_user_id:
+                            self._award_tier_promotion_rerolls_if_due(
+                                conn,
+                                discord_user_id=mapped_discord_user_id,
+                                rsn=rsn,
+                            )
+                        rewarded_users: set[str] = set()
+                        for discord_user_id, task_id in newly_verified_claims:
+                            if discord_user_id not in rewarded_users:
+                                self._award_due_rerolls(conn, discord_user_id)
+                                rewarded_users.add(discord_user_id)
+                            self._award_boss_completion_reroll_if_due(
+                                conn,
+                                discord_user_id=discord_user_id,
+                                rsn=rsn,
+                                task_id=task_id,
+                            )
                         conn.commit()
                     except Exception:
                         conn.rollback()
@@ -392,6 +585,8 @@ class SyncService:
     def pick_random_task(self, discord_user_id: str, rsn: str) -> RandomTaskResult | None:
         with self.db.connection() as conn:
             latest_scan_id = self.db.get_latest_completed_scan_run_id(conn)
+            current_tier = self._get_current_tier_threshold(conn, rsn)
+            current_tier_rank = current_tier.rank if current_tier is not None else 0
             incomplete_ids = self.db.get_incomplete_task_ids(conn, rsn)
             claimed_ids = self.db.get_claimed_task_ids_for_scan(
                 conn,
@@ -400,11 +595,16 @@ class SyncService:
                 scan_run_id=latest_scan_id,
             )
 
-            eligible_ids = compute_eligible_task_ids(incomplete_ids, claimed_ids)
+            eligible_ids = self._filter_assignable_task_ids(
+                conn,
+                compute_eligible_task_ids(incomplete_ids, claimed_ids),
+                incomplete_ids=incomplete_ids,
+                current_tier_rank=current_tier_rank,
+            )
             if not eligible_ids:
                 return None
 
-            task_id = self._rand.choice(eligible_ids)
+            task_id = self._pick_weighted_task_id(conn, eligible_ids)
             metadata = self.db.get_task_metadata(conn, task_id)
 
             if metadata is None:
@@ -473,6 +673,188 @@ class SyncService:
             eligible_count=eligible_count,
         )
 
+    def _filter_assignable_task_ids(
+        self,
+        conn,
+        eligible_ids: Iterable[int],
+        *,
+        incomplete_ids: Iterable[int],
+        current_tier_rank: int,
+    ) -> list[int]:
+        eligible = sorted({int(task_id) for task_id in eligible_ids})
+        if not eligible:
+            return []
+
+        incomplete = {int(task_id) for task_id in incomplete_ids}
+        metadata_by_id = self.db.get_task_metadata_for_ids(conn, sorted(set(eligible) | incomplete))
+        eligible = filter_task_ids_by_tier_cap(
+            eligible,
+            metadata_by_id,
+            current_tier_rank=current_tier_rank,
+        )
+        if not eligible:
+            return []
+        incomplete_by_npc: dict[str, set[int]] = {}
+
+        for task_id in incomplete:
+            metadata = metadata_by_id.get(task_id)
+            npc_key = _npc_group_key(metadata.get("npc") if metadata else None)
+            if not npc_key:
+                continue
+            incomplete_by_npc.setdefault(npc_key, set()).add(task_id)
+
+        filtered: list[int] = []
+        for task_id in eligible:
+            metadata = metadata_by_id.get(task_id)
+            task_type_key = _normalize_task_type(metadata.get("task_type") if metadata else None)
+            if task_type_key != "killcount":
+                filtered.append(task_id)
+                continue
+
+            npc_key = _npc_group_key(metadata.get("npc") if metadata else None)
+            if not npc_key:
+                filtered.append(task_id)
+                continue
+
+            remaining_for_boss = incomplete_by_npc.get(npc_key, set())
+            if remaining_for_boss <= {task_id}:
+                filtered.append(task_id)
+
+        return filtered
+
+    def _award_due_rerolls(self, conn, discord_user_id: str) -> tuple[int, int, int]:
+        profile = self.db.get_user_task_profile(conn, discord_user_id, for_update=True)
+        rerolls_available = int(profile["rerolls_available"] or 0)
+        current_batches = int(profile["completion_reward_batches"] or 0)
+        verified_count = self.db.count_verified_task_claims(conn, discord_user_id)
+        target_batches = verified_count // 3
+        award_count = max(target_batches - current_batches, 0)
+        if award_count > 0:
+            rerolls_available += award_count
+            self.db.update_user_task_profile(
+                conn,
+                discord_user_id,
+                rerolls_available=rerolls_available,
+                completion_reward_batches=target_batches,
+            )
+        return award_count, rerolls_available, verified_count
+
+    def _award_boss_completion_reroll_if_due(
+        self,
+        conn,
+        discord_user_id: str,
+        rsn: str,
+        task_id: int,
+    ) -> int:
+        metadata = self.db.get_task_metadata(conn, task_id)
+        npc = str(metadata.get("npc") or "").strip() if metadata else ""
+        npc_key = _npc_group_key(npc)
+        if not npc_key:
+            return 0
+
+        incomplete_ids = self.db.get_incomplete_task_ids(conn, rsn)
+        if incomplete_ids:
+            incomplete_metadata = self.db.get_task_metadata_for_ids(conn, sorted(incomplete_ids))
+            for incomplete_task_id in incomplete_ids:
+                incomplete_npc_key = _npc_group_key(
+                    incomplete_metadata.get(incomplete_task_id, {}).get("npc"),
+                )
+                if incomplete_npc_key == npc_key:
+                    return 0
+
+        inserted = self.db.record_boss_completion_reroll_reward(
+            conn,
+            discord_user_id=discord_user_id,
+            rsn=rsn,
+            npc=npc,
+            rewarded_task_id=task_id,
+        )
+        if not inserted:
+            return 0
+
+        profile = self.db.get_user_task_profile(conn, discord_user_id, for_update=True)
+        rerolls_available = int(profile["rerolls_available"] or 0) + 1
+        self.db.update_user_task_profile(
+            conn,
+            discord_user_id,
+            rerolls_available=rerolls_available,
+        )
+        return 1
+
+    def _get_catalog_tier_thresholds(self, conn) -> list[TierThreshold]:
+        tier_totals = self.db.get_catalog_point_totals_by_tier(conn)
+        thresholds: list[TierThreshold] = []
+        cumulative_points = 0
+
+        for rank, (tier_key, tier_label) in enumerate(_TIER_ORDER, start=1):
+            matched_points = 0
+            for catalog_label, tier_points in tier_totals.items():
+                if _normalize_tier_label(catalog_label) == tier_key:
+                    matched_points = int(tier_points or 0)
+                    break
+            if matched_points <= 0:
+                continue
+            cumulative_points += matched_points
+            thresholds.append(
+                TierThreshold(
+                    rank=rank,
+                    key=tier_key,
+                    label=tier_label,
+                    required_points=cumulative_points,
+                )
+            )
+
+        return thresholds
+
+    def _get_current_tier_threshold(self, conn, rsn: str) -> TierThreshold | None:
+        total_points = self.db.get_progress_summary(conn, rsn)["total_points"]
+        current_tier: TierThreshold | None = None
+        for threshold in self._get_catalog_tier_thresholds(conn):
+            if total_points >= threshold.required_points:
+                current_tier = threshold
+            else:
+                break
+        return current_tier
+
+    def _award_tier_promotion_rerolls_if_due(
+        self,
+        conn,
+        discord_user_id: str,
+        rsn: str,
+    ) -> int:
+        current_tier = self._get_current_tier_threshold(conn, rsn)
+        if current_tier is None:
+            return 0
+
+        state = self.db.get_rsn_tier_reward_state(conn, rsn, for_update=True)
+        previously_rewarded_rank = int(state["highest_rewarded_tier_rank"] or 0)
+        if current_tier.rank <= previously_rewarded_rank:
+            return 0
+
+        tiers_crossed = current_tier.rank - previously_rewarded_rank
+        rerolls_to_award = tiers_crossed * 3
+
+        profile = self.db.get_user_task_profile(conn, discord_user_id, for_update=True)
+        rerolls_available = int(profile["rerolls_available"] or 0) + rerolls_to_award
+        self.db.update_user_task_profile(
+            conn,
+            discord_user_id,
+            rerolls_available=rerolls_available,
+        )
+        self.db.update_rsn_tier_reward_state(
+            conn,
+            rsn,
+            highest_rewarded_tier_rank=current_tier.rank,
+            highest_rewarded_tier_label=current_tier.label,
+        )
+        return rerolls_to_award
+
+    def _get_user_profile_snapshot(self, conn, discord_user_id: str) -> tuple[int, int]:
+        profile = self.db.get_user_task_profile(conn, discord_user_id)
+        rerolls_available = int(profile["rerolls_available"] or 0)
+        reward_batches = int(profile["completion_reward_batches"] or 0)
+        return rerolls_available, reward_batches
+
     def get_or_assign_active_task(self, discord_user_id: str, rsn_override: str | None = None) -> ActiveTaskAssignment | None:
         with self.db.connection() as conn:
             rsn = (rsn_override or "").strip()
@@ -482,6 +864,8 @@ class SyncService:
                 return None
 
             latest_scan_id = self.db.get_latest_completed_scan_run_id(conn)
+            current_tier = self._get_current_tier_threshold(conn, rsn)
+            current_tier_rank = current_tier.rank if current_tier is not None else 0
             active = self.db.get_active_task(conn, discord_user_id, rsn)
             if active is not None:
                 active_rsn = str(active["rsn"]).strip()
@@ -496,6 +880,12 @@ class SyncService:
                 eligible_ids = compute_eligible_task_ids(
                     self.db.get_incomplete_task_ids(conn, active_rsn),
                     claimed_ids,
+                )
+                eligible_ids = self._filter_assignable_task_ids(
+                    conn,
+                    eligible_ids,
+                    incomplete_ids=self.db.get_incomplete_task_ids(conn, active_rsn),
+                    current_tier_rank=current_tier_rank,
                 )
                 if (
                     active_rsn.casefold() == rsn.casefold()
@@ -517,11 +907,16 @@ class SyncService:
                 rsn=rsn,
                 scan_run_id=latest_scan_id,
             )
-            eligible_ids = compute_eligible_task_ids(incomplete_ids, claimed_ids)
+            eligible_ids = self._filter_assignable_task_ids(
+                conn,
+                compute_eligible_task_ids(incomplete_ids, claimed_ids),
+                incomplete_ids=incomplete_ids,
+                current_tier_rank=current_tier_rank,
+            )
             if not eligible_ids:
                 return None
 
-            task_id = self._rand.choice(eligible_ids)
+            task_id = self._pick_weighted_task_id(conn, eligible_ids)
             self.db.upsert_active_task(
                 conn,
                 discord_user_id=discord_user_id,
@@ -543,6 +938,58 @@ class SyncService:
     def resolve_rsns_for_discord_user(self, discord_user_id: str) -> list[str]:
         with self.db.connection() as conn:
             return self.db.get_rsns_for_discord_user(conn, discord_user_id)
+
+    def get_user_task_profile_summary(self, discord_user_id: str) -> UserTaskProfileSummary:
+        with self.db.connection() as conn:
+            awarded_rerolls, _, _ = self._award_due_rerolls(conn, discord_user_id)
+            if awarded_rerolls > 0:
+                conn.commit()
+            rerolls_available, _reward_batches = self._get_user_profile_snapshot(conn, discord_user_id)
+            active_tasks = [
+                ActiveTaskSummary(
+                    rsn=str(row["rsn"]).strip(),
+                    task=self._build_task_result(conn, int(row["task_id"]), eligible_count=0),
+                )
+                for row in self.db.get_active_tasks(conn, discord_user_id)
+            ]
+            verified_counts_by_rsn = self.db.get_verified_task_claim_counts_by_rsn(conn, discord_user_id)
+
+            account_order: list[str] = []
+            seen_rsns: set[str] = set()
+            for rsn in self.db.get_rsns_for_discord_user(conn, discord_user_id):
+                key = rsn.casefold()
+                if key in seen_rsns:
+                    continue
+                seen_rsns.add(key)
+                account_order.append(rsn)
+            for rsn in verified_counts_by_rsn:
+                key = rsn.casefold()
+                if key in seen_rsns:
+                    continue
+                seen_rsns.add(key)
+                account_order.append(rsn)
+            for active in active_tasks:
+                key = active.rsn.casefold()
+                if key in seen_rsns:
+                    continue
+                seen_rsns.add(key)
+                account_order.append(active.rsn)
+
+            completed_tasks_by_account = [
+                AccountCompletedTasksSummary(
+                    rsn=rsn,
+                    completed_tasks=int(verified_counts_by_rsn.get(rsn, 0) or 0),
+                    total_points=self.db.get_progress_summary(conn, rsn)["total_points"],
+                )
+                for rsn in account_order
+            ]
+
+            return UserTaskProfileSummary(
+                discord_user_id=discord_user_id,
+                rerolls_available=rerolls_available,
+                completed_tasks_by_account=completed_tasks_by_account,
+                active_tasks=active_tasks,
+            )
 
     def mark_claim_complete(
         self,
@@ -586,7 +1033,8 @@ class SyncService:
         guild_id: str | None,
         channel_id: str | None,
         message_id: str | None,
-    ) -> tuple[str, RandomTaskResult] | None:
+    ) -> CompletionResult | None:
+        task: RandomTaskResult
         with self.db.connection() as conn:
             active = self.db.get_active_task(conn, discord_user_id, rsn)
             if active is None:
@@ -594,6 +1042,7 @@ class SyncService:
 
             active_rsn = str(active["rsn"]).strip()
             task_id = int(active["task_id"])
+            task = self._build_task_result(conn, task_id, eligible_count=0)
 
             try:
                 latest_scan_id = self.db.get_latest_completed_scan_run_id(conn)
@@ -621,9 +1070,79 @@ class SyncService:
                 conn.rollback()
                 raise
 
-            return active_rsn, self._build_task_result(conn, task_id, eligible_count=0)
+        live_verification_attempted = False
+        live_verified = False
+        awarded_rerolls = 0
 
-    def reroll_active_task_too_hard(self, discord_user_id: str, rsn: str) -> TooHardResult | None:
+        try:
+            payload = self.fetch_runelite_payload(active_rsn)
+            live_verification_attempted = True
+            completed_ids = extract_completed_ca_task_ids(payload)
+            if task_id in completed_ids:
+                with self.db.connection() as conn:
+                    try:
+                        latest_scan_id = self.db.get_latest_completed_scan_run_id(conn)
+                        self.db.upsert_single_progress(
+                            conn,
+                            rsn=active_rsn,
+                            task_id=task_id,
+                            is_complete=True,
+                            source="verify",
+                            source_scan_run_id=latest_scan_id,
+                        )
+                        previous_status, claim_status = self.db.mark_task_verified(
+                            conn,
+                            discord_user_id=discord_user_id,
+                            rsn=active_rsn,
+                            task_id=task_id,
+                            is_complete=True,
+                            verified_scan_run_id=latest_scan_id,
+                        )
+                        if claim_status == "verified_complete" and previous_status != "verified_complete":
+                            completion_bonus, _, _ = self._award_due_rerolls(conn, discord_user_id)
+                            boss_bonus = self._award_boss_completion_reroll_if_due(
+                                conn,
+                                discord_user_id=discord_user_id,
+                                rsn=active_rsn,
+                                task_id=task_id,
+                            )
+                            tier_bonus = self._award_tier_promotion_rerolls_if_due(
+                                conn,
+                                discord_user_id=discord_user_id,
+                                rsn=active_rsn,
+                            )
+                            awarded_rerolls = completion_bonus + boss_bonus + tier_bonus
+                        conn.commit()
+                        live_verified = True
+                    except Exception:
+                        conn.rollback()
+                        raise
+        except Exception:
+            LOGGER.exception(
+                "Live verification failed for user %s rsn %s task %s",
+                discord_user_id,
+                active_rsn,
+                task_id,
+            )
+
+        with self.db.connection() as conn:
+            awarded_rerolls_snapshot, _, _ = self._award_due_rerolls(conn, discord_user_id)
+            if awarded_rerolls_snapshot > 0:
+                conn.commit()
+            rerolls_available, _reward_batches = self._get_user_profile_snapshot(conn, discord_user_id)
+            verified_assigned_completions = self.db.count_verified_task_claims(conn, discord_user_id)
+
+        return CompletionResult(
+            rsn=active_rsn,
+            task=task,
+            rerolls_remaining=rerolls_available,
+            awarded_rerolls=awarded_rerolls,
+            verified_assigned_completions=verified_assigned_completions,
+            live_verification_attempted=live_verification_attempted,
+            live_verified=live_verified,
+        )
+
+    def reroll_active_task(self, discord_user_id: str, rsn: str) -> RerollResult | None:
         with self.db.connection() as conn:
             active = self.db.get_active_task(conn, discord_user_id, rsn)
             if active is None:
@@ -637,6 +1156,8 @@ class SyncService:
                 return None
 
             latest_scan_id = self.db.get_latest_completed_scan_run_id(conn)
+            current_tier = self._get_current_tier_threshold(conn, rsn)
+            current_tier_rank = current_tier.rank if current_tier is not None else 0
             incomplete_ids = self.db.get_incomplete_task_ids(conn, rsn)
             claimed_ids = self.db.get_claimed_task_ids_for_scan(
                 conn,
@@ -644,24 +1165,43 @@ class SyncService:
                 rsn=rsn,
                 scan_run_id=latest_scan_id,
             )
-            eligible_ids = compute_eligible_task_ids(incomplete_ids, claimed_ids)
+            eligible_ids = self._filter_assignable_task_ids(
+                conn,
+                compute_eligible_task_ids(incomplete_ids, claimed_ids),
+                incomplete_ids=incomplete_ids,
+                current_tier_rank=current_tier_rank,
+            )
             current_task = self._build_task_result(conn, task_id, len(eligible_ids))
-            candidates = [candidate_id for candidate_id in eligible_ids if candidate_id != task_id]
-
-            if current_task.points is not None and candidates:
-                metadata_by_id = self.db.get_task_metadata_for_ids(conn, candidates)
-                candidates = [
-                    candidate_id
-                    for candidate_id in candidates
-                    if metadata_by_id.get(candidate_id) is not None
-                    and metadata_by_id[candidate_id].get("points") is not None
-                    and int(metadata_by_id[candidate_id]["points"]) < int(current_task.points)
-                ]
+            metadata_by_id = self.db.get_task_metadata_for_ids(conn, sorted(set(eligible_ids) | {task_id}))
+            candidates = filter_reroll_candidate_ids(
+                task_id,
+                eligible_ids,
+                metadata_by_id,
+            )
+            awarded_rerolls, _, _ = self._award_due_rerolls(conn, discord_user_id)
+            if awarded_rerolls > 0:
+                conn.commit()
+            rerolls_available, _reward_batches = self._get_user_profile_snapshot(conn, discord_user_id)
 
             if not candidates:
-                return TooHardResult(rsn=rsn, previous_task=current_task, replacement_task=None)
+                return RerollResult(
+                    rsn=rsn,
+                    previous_task=current_task,
+                    replacement_task=None,
+                    rerolls_remaining=rerolls_available,
+                )
 
-            next_task_id = self._rand.choice(candidates)
+            profile = self.db.get_user_task_profile(conn, discord_user_id, for_update=True)
+            rerolls_available = int(profile["rerolls_available"] or 0)
+            if rerolls_available <= 0:
+                return RerollResult(
+                    rsn=rsn,
+                    previous_task=current_task,
+                    replacement_task=None,
+                    rerolls_remaining=0,
+                )
+
+            next_task_id = self._pick_weighted_task_id(conn, candidates)
             self.db.upsert_active_task(
                 conn,
                 discord_user_id=discord_user_id,
@@ -669,10 +1209,21 @@ class SyncService:
                 task_id=next_task_id,
                 assigned_scan_run_id=latest_scan_id,
             )
+            rerolls_available -= 1
+            self.db.update_user_task_profile(
+                conn,
+                discord_user_id,
+                rerolls_available=rerolls_available,
+            )
             conn.commit()
 
             replacement = self._build_task_result(conn, next_task_id, len(candidates))
-            return TooHardResult(rsn=rsn, previous_task=current_task, replacement_task=replacement)
+            return RerollResult(
+                rsn=rsn,
+                previous_task=current_task,
+                replacement_task=replacement,
+                rerolls_remaining=rerolls_available,
+            )
 
     def verify_task_live(
         self,
@@ -696,7 +1247,7 @@ class SyncService:
                     source=source,
                     source_scan_run_id=latest_scan_id,
                 )
-                claim_status = self.db.mark_task_verified(
+                previous_status, claim_status = self.db.mark_task_verified(
                     conn,
                     discord_user_id=discord_user_id,
                     rsn=rsn,
@@ -704,6 +1255,19 @@ class SyncService:
                     is_complete=is_complete,
                     verified_scan_run_id=latest_scan_id,
                 )
+                if claim_status == "verified_complete" and previous_status != "verified_complete":
+                    self._award_due_rerolls(conn, discord_user_id)
+                    self._award_boss_completion_reroll_if_due(
+                        conn,
+                        discord_user_id=discord_user_id,
+                        rsn=rsn,
+                        task_id=task_id,
+                    )
+                    self._award_tier_promotion_rerolls_if_due(
+                        conn,
+                        discord_user_id=discord_user_id,
+                        rsn=rsn,
+                    )
                 conn.commit()
             except Exception:
                 conn.rollback()

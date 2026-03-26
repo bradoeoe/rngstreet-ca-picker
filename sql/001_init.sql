@@ -1,9 +1,9 @@
-CREATE TABLE IF NOT EXISTS schema_migrations (
+CREATE TABLE IF NOT EXISTS ca_schema_migrations (
   version VARCHAR(64) NOT NULL PRIMARY KEY,
   applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE IF NOT EXISTS scan_runs (
+CREATE TABLE IF NOT EXISTS ca_scan_runs (
   id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
   trigger_source VARCHAR(32) NOT NULL,
   status VARCHAR(24) NOT NULL,
@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS scan_runs (
   error_text TEXT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE IF NOT EXISTS player_snapshots (
+CREATE TABLE IF NOT EXISTS ca_player_snapshots (
   id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
   scan_run_id BIGINT NOT NULL,
   rsn VARCHAR(32) NOT NULL,
@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS player_snapshots (
   UNIQUE KEY uq_snapshot_run_rsn (scan_run_id, rsn),
   KEY idx_snapshot_rsn_fetched (rsn, fetched_at),
   CONSTRAINT fk_snapshot_scan_run
-    FOREIGN KEY (scan_run_id) REFERENCES scan_runs(id)
+    FOREIGN KEY (scan_run_id) REFERENCES ca_scan_runs(id)
     ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -54,11 +54,11 @@ CREATE TABLE IF NOT EXISTS ca_progress (
     FOREIGN KEY (task_id) REFERENCES ca_task_catalog(task_id)
     ON DELETE CASCADE,
   CONSTRAINT fk_progress_scan_run
-    FOREIGN KEY (source_scan_run_id) REFERENCES scan_runs(id)
+    FOREIGN KEY (source_scan_run_id) REFERENCES ca_scan_runs(id)
     ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE IF NOT EXISTS task_claims (
+CREATE TABLE IF NOT EXISTS ca_task_claims (
   id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
   discord_user_id VARCHAR(32) NOT NULL,
   rsn VARCHAR(32) NOT NULL,
@@ -79,9 +79,9 @@ CREATE TABLE IF NOT EXISTS task_claims (
     FOREIGN KEY (task_id) REFERENCES ca_task_catalog(task_id)
     ON DELETE CASCADE,
   CONSTRAINT fk_claim_scan_run
-    FOREIGN KEY (claim_scan_run_id) REFERENCES scan_runs(id)
+    FOREIGN KEY (claim_scan_run_id) REFERENCES ca_scan_runs(id)
     ON DELETE SET NULL,
   CONSTRAINT fk_claim_verify_scan_run
-    FOREIGN KEY (verified_scan_run_id) REFERENCES scan_runs(id)
+    FOREIGN KEY (verified_scan_run_id) REFERENCES ca_scan_runs(id)
     ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
