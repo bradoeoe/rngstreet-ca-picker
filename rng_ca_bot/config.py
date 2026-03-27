@@ -30,7 +30,9 @@ class Settings:
     runelite_account_type: str
     http_user_agent: str
     task_panel_channel_id: int | None
+    highscores_panel_channel_id: int | None
     log_level: str
+    log_file: str | None
     tier_assignment_weights: dict[str, int]
 
     @property
@@ -92,6 +94,9 @@ def load_settings() -> Settings:
 
     panel_channel_raw = os.getenv("DISCORD_TASK_PANEL_CHANNEL_ID", "").strip()
     task_panel_channel_id = int(panel_channel_raw) if panel_channel_raw else None
+    highscores_channel_raw = os.getenv("DISCORD_HIGHSCORES_CHANNEL_ID", "").strip()
+    highscores_panel_channel_id = int(highscores_channel_raw) if highscores_channel_raw else None
+    log_file_raw = os.getenv("LOG_FILE", "logs/rng_ca_bot.log").strip()
 
     return Settings(
         discord_token=discord_token,
@@ -106,6 +111,8 @@ def load_settings() -> Settings:
         runelite_account_type=os.getenv("RUNELITE_ACCOUNT_TYPE", "STANDARD"),
         http_user_agent=os.getenv("HTTP_USER_AGENT", "RNG-CA-Bot/1.0"),
         task_panel_channel_id=task_panel_channel_id,
+        highscores_panel_channel_id=highscores_panel_channel_id,
         log_level=os.getenv("LOG_LEVEL", "INFO"),
+        log_file=log_file_raw or None,
         tier_assignment_weights=_parse_tier_assignment_weights(os.getenv("TIER_ASSIGNMENT_WEIGHTS")),
     )

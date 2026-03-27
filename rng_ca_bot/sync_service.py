@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from html import unescape
 from typing import Iterable, Mapping
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -34,6 +35,50 @@ _TIER_ORDER: tuple[tuple[str, str], ...] = (
     ("grandmaster", "Grandmaster"),
 )
 _TIER_RANKS: dict[str, int] = {tier_key: rank for rank, (tier_key, _label) in enumerate(_TIER_ORDER, start=1)}
+_BOSS_IMAGE_OVERRIDES: dict[str, str] = {
+    "aberrant spectre": "https://oldschool.runescape.wiki/images/Aberrant_spectre.png?65d6f",
+    "aberrant spectres": "https://oldschool.runescape.wiki/images/Aberrant_spectre.png?65d6f",
+    "alchemical hydra": "https://oldschool.runescape.wiki/images/thumb/Alchemical_Hydra_%28serpentine%29.png/543px-Alchemical_Hydra_%28serpentine%29.png?925dd",
+    "barrows": "https://oldschool.runescape.wiki/images/thumb/Dharok_the_Wretched.png/228px-Dharok_the_Wretched.png?33092",
+    "black dragon": "https://oldschool.runescape.wiki/images/thumb/Black_dragon.png/580px-Black_dragon.png?b8574",
+    "black dragons": "https://oldschool.runescape.wiki/images/thumb/Black_dragon.png/580px-Black_dragon.png?b8574",
+    "brutal black dragon": "https://oldschool.runescape.wiki/images/thumb/Brutal_black_dragon.png/580px-Brutal_black_dragon.png?24f54",
+    "brutal black dragons": "https://oldschool.runescape.wiki/images/thumb/Brutal_black_dragon.png/580px-Brutal_black_dragon.png?24f54",
+    "chambers of xeric": "https://oldschool.runescape.wiki/w/Special:FilePath/Great_Olm.png",
+    "chambers of xeric: challenge mode": "https://oldschool.runescape.wiki/w/Special:FilePath/Great_Olm.png",
+    "crazy archaeologist": "https://oldschool.runescape.wiki/images/Crazy_archaeologist.png?3ecc9",
+    "demonic gorilla": "https://oldschool.runescape.wiki/images/Demonic_gorilla.png?26536",
+    "demonic gorillas": "https://oldschool.runescape.wiki/images/Demonic_gorilla.png?26536",
+    "deranged archaeologist": "https://oldschool.runescape.wiki/images/Deranged_archaeologist.png?32c7e",
+    "fire giant": "https://oldschool.runescape.wiki/images/Fire_giant_%285%29.png?870b3",
+    "fire giants": "https://oldschool.runescape.wiki/images/Fire_giant_%285%29.png?870b3",
+    "fortis colosseum": "https://oldschool.runescape.wiki/w/Special:FilePath/Sol_Heredit.png",
+    "greater demon": "https://oldschool.runescape.wiki/images/Greater_demon.png?f293e",
+    "greater demons": "https://oldschool.runescape.wiki/images/Greater_demon.png?f293e",
+    "grotesque guardians": "https://oldschool.runescape.wiki/images/Dawn.png?8b8ea",
+    "leviathan": "https://oldschool.runescape.wiki/images/The_Leviathan.png?d588a",
+    "lizardman shaman": "https://oldschool.runescape.wiki/images/thumb/Lizardman_shaman_%281%29.png/400px-Lizardman_shaman_%281%29.png?f127d",
+    "lizardman shamans": "https://oldschool.runescape.wiki/images/thumb/Lizardman_shaman_%281%29.png/400px-Lizardman_shaman_%281%29.png?f127d",
+    "n/a": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSct86lyd3Z1LnvnSvfzZvQc776_JbpT4KC7Q&s",
+    "theatre of blood": "https://oldschool.runescape.wiki/w/Special:FilePath/Verzik_Vitur_(final_form).png",
+    "theatre of blood: entry mode": "https://oldschool.runescape.wiki/w/Special:FilePath/Verzik_Vitur_(final_form).png",
+    "theatre of blood: hard mode": "https://oldschool.runescape.wiki/w/Special:FilePath/Verzik_Vitur_(final_form).png",
+    "tombs of amascut": "https://oldschool.runescape.wiki/w/Special:FilePath/Zebak.png",
+    "tombs of amascut: entry mode": "https://oldschool.runescape.wiki/w/Special:FilePath/Zebak.png",
+    "tombs of amascut: expert mode": "https://oldschool.runescape.wiki/w/Special:FilePath/Zebak.png",
+    "thermonuclear smoke devil": "https://oldschool.runescape.wiki/w/Special:FilePath/Thermonuclear_smoke_devil.png",
+    "tormented demon": "https://oldschool.runescape.wiki/w/Special:FilePath/Tormented_Demon_(1).png",
+    "tormented demons": "https://oldschool.runescape.wiki/w/Special:FilePath/Tormented_Demon_(1).png",
+    "tzhaar-ket-rak's challenges": "https://oldschool.runescape.wiki/w/Special:FilePath/JalTok-Jad.png",
+    "phosani's nightmare": "https://oldschool.runescape.wiki/w/Special:FilePath/The_Nightmare.png",
+    "phantom muspah": "https://oldschool.runescape.wiki/w/Special:FilePath/Phantom_Muspah_(ranged).png",
+    "the whisperer": "https://oldschool.runescape.wiki/w/Special:FilePath/The_Whisperer.png",
+    "whisperer": "https://oldschool.runescape.wiki/w/Special:FilePath/The_Whisperer.png",
+    "wintertodt": "https://oldschool.runescape.wiki/images/Howling_Snow_Storm.gif?ec549",
+    "moons of peril": "https://oldschool.runescape.wiki/images/Eclipse_Moon.png?c3e72",
+    "royal titans": "https://oldschool.runescape.wiki/images/Branda_the_Fire_Queen.png?0687c",
+    "zulrah": "https://oldschool.runescape.wiki/w/Special:FilePath/Zulrah_(serpentine).png",
+}
 
 
 @dataclass(slots=True)
@@ -105,6 +150,46 @@ class TierThreshold:
     required_points: int
 
 
+@dataclass(slots=True)
+class BotHighscoreEntry:
+    rsn: str
+    verified_tasks: int
+    verified_points: int
+
+
+@dataclass(slots=True)
+class TierLeaderEntry:
+    rsn: str
+    completed_tasks: int
+    total_points: int
+    tier_label: str
+
+
+@dataclass(slots=True)
+class HighscoresSummary:
+    title: str
+    description: str
+    entries: list["HighscoresEntry"]
+    empty_text: str
+    reset_text: str | None = None
+
+
+@dataclass(slots=True)
+class HighscoresEntry:
+    rank: int
+    rsn: str
+    headline: str
+    detail: str
+
+
+@dataclass(slots=True)
+class BossImageMapping:
+    npc: str
+    npc_url: str | None
+    npc_image_url: str | None
+    task_count: int
+
+
 class RuneLiteSyncError(Exception):
     def __init__(self, rsn: str, status_code: int, code: str | None, message: str) -> None:
         self.rsn = rsn
@@ -150,6 +235,11 @@ def _extract_first_href(cell_html: str) -> str | None:
 
 
 def _infer_npc_image_url(npc_url: str | None, npc_name: str | None) -> str | None:
+    if npc_name:
+        override = _BOSS_IMAGE_OVERRIDES.get(" ".join(npc_name.split()).casefold())
+        if override:
+            return override
+
     slug: str | None = None
     if npc_url and "/w/" in npc_url:
         slug = npc_url.split("/w/", 1)[1]
@@ -588,6 +678,7 @@ class SyncService:
             current_tier = self._get_current_tier_threshold(conn, rsn)
             current_tier_rank = current_tier.rank if current_tier is not None else 0
             incomplete_ids = self.db.get_incomplete_task_ids(conn, rsn)
+            remaining_count = len(incomplete_ids)
             claimed_ids = self.db.get_claimed_task_ids_for_scan(
                 conn,
                 discord_user_id=discord_user_id,
@@ -621,7 +712,7 @@ class SyncService:
                 task_description = metadata.get("description")
                 npc = metadata.get("npc")
                 npc_url = metadata.get("npc_url")
-                npc_image_url = metadata.get("npc_image_url")
+                npc_image_url = _infer_npc_image_url(npc_url, npc) or metadata.get("npc_image_url")
                 task_type = metadata.get("task_type")
                 tier_label = metadata.get("tier_label")
                 points = metadata.get("points")
@@ -636,7 +727,7 @@ class SyncService:
                 task_type=task_type,
                 tier_label=tier_label,
                 points=points,
-                eligible_count=len(eligible_ids),
+                eligible_count=remaining_count,
             )
 
     def _build_task_result(self, conn, task_id: int, eligible_count: int) -> RandomTaskResult:
@@ -655,7 +746,7 @@ class SyncService:
             task_description = metadata.get("description")
             npc = metadata.get("npc")
             npc_url = metadata.get("npc_url")
-            npc_image_url = metadata.get("npc_image_url")
+            npc_image_url = _infer_npc_image_url(npc_url, npc) or metadata.get("npc_image_url")
             task_type = metadata.get("task_type")
             tier_label = metadata.get("tier_label")
             points = metadata.get("points")
@@ -806,15 +897,162 @@ class SyncService:
 
         return thresholds
 
-    def _get_current_tier_threshold(self, conn, rsn: str) -> TierThreshold | None:
-        total_points = self.db.get_progress_summary(conn, rsn)["total_points"]
+    def _get_tier_threshold_for_points(self, conn, total_points: int) -> TierThreshold | None:
         current_tier: TierThreshold | None = None
         for threshold in self._get_catalog_tier_thresholds(conn):
-            if total_points >= threshold.required_points:
+            if int(total_points) >= threshold.required_points:
                 current_tier = threshold
             else:
                 break
         return current_tier
+
+    def _get_current_tier_threshold(self, conn, rsn: str) -> TierThreshold | None:
+        total_points = self.db.get_progress_summary(conn, rsn)["total_points"]
+        return self._get_tier_threshold_for_points(conn, total_points)
+
+    def _get_local_month_window(self) -> tuple[datetime, datetime, str, str]:
+        try:
+            tz = ZoneInfo(self.settings.timezone)
+        except Exception:
+            LOGGER.warning("Invalid TIMEZONE '%s'; defaulting leaderboard window to UTC", self.settings.timezone)
+            tz = ZoneInfo("UTC")
+
+        now = datetime.now(tz)
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if start.month == 12:
+            end = start.replace(year=start.year + 1, month=1)
+        else:
+            end = start.replace(month=start.month + 1)
+        days_remaining = max((end.date() - now.date()).days, 0)
+        reset_text = "today" if days_remaining == 0 else f"in {days_remaining} day{'s' if days_remaining != 1 else ''}"
+        return start.replace(tzinfo=None), end.replace(tzinfo=None), now.strftime("%B %Y"), reset_text
+
+    def get_monthly_highscores_summary(self, limit: int | None = None) -> HighscoresSummary:
+        start_at, end_at, month_label, reset_text = self._get_local_month_window()
+        with self.db.connection() as conn:
+            rows = self.db.get_verified_claim_leaderboard(
+                conn,
+                limit=limit if limit is None or limit > 0 else None,
+                start_at=start_at,
+                end_at=end_at,
+            )
+
+        ranked_entries = [
+            BotHighscoreEntry(
+                rsn=str(row.get("rsn") or "").strip(),
+                verified_tasks=int(row.get("verified_tasks") or 0),
+                verified_points=int(row.get("verified_points") or 0),
+            )
+            for row in rows
+            if str(row.get("rsn") or "").strip()
+        ]
+        entries = [
+            HighscoresEntry(
+                rank=index,
+                rsn=entry.rsn,
+                headline=f"{entry.verified_points} pts",
+                detail=f"{entry.verified_tasks} verified tasks",
+            )
+            for index, entry in enumerate(ranked_entries, start=1)
+        ]
+        return HighscoresSummary(
+            title=f"Monthly Highscores - {month_label}",
+            description="Verified bot-assigned progress earned this month.",
+            entries=entries,
+            empty_text="No verified bot completions yet this month.",
+            reset_text=reset_text,
+        )
+
+    def get_all_time_highscores_summary(self, limit: int | None = None) -> HighscoresSummary:
+        with self.db.connection() as conn:
+            rows = self.db.get_verified_claim_leaderboard(
+                conn,
+                limit=limit if limit is None or limit > 0 else None,
+            )
+
+        ranked_entries = [
+            BotHighscoreEntry(
+                rsn=str(row.get("rsn") or "").strip(),
+                verified_tasks=int(row.get("verified_tasks") or 0),
+                verified_points=int(row.get("verified_points") or 0),
+            )
+            for row in rows
+            if str(row.get("rsn") or "").strip()
+        ]
+        entries = [
+            HighscoresEntry(
+                rank=index,
+                rsn=entry.rsn,
+                headline=f"{entry.verified_points} pts",
+                detail=f"{entry.verified_tasks} verified tasks",
+            )
+            for index, entry in enumerate(ranked_entries, start=1)
+        ]
+        return HighscoresSummary(
+            title="All-Time Bot Highscores",
+            description="Verified progress earned through bot-assigned tasks.",
+            entries=entries,
+            empty_text="No verified bot completions have been recorded yet.",
+        )
+
+    def get_overall_tier_leaders_summary(self, limit: int | None = None) -> HighscoresSummary:
+        with self.db.connection() as conn:
+            rows = self.db.get_progress_leaderboard(
+                conn,
+                limit=limit if limit is None or limit > 0 else None,
+            )
+            tier_entries = []
+            for row in rows:
+                rsn = str(row.get("rsn") or "").strip()
+                if not rsn:
+                    continue
+                total_points = int(row.get("total_points") or 0)
+                current_tier = self._get_tier_threshold_for_points(conn, total_points)
+                tier_entries.append(
+                    TierLeaderEntry(
+                        rsn=rsn,
+                        completed_tasks=int(row.get("completed_tasks") or 0),
+                        total_points=total_points,
+                        tier_label=current_tier.label if current_tier is not None else "Unranked",
+                    )
+                )
+
+        entries = [
+            HighscoresEntry(
+                rank=index,
+                rsn=entry.rsn,
+                headline=f"{entry.tier_label} - {entry.total_points} pts",
+                detail=f"{entry.completed_tasks} completed tasks",
+            )
+            for index, entry in enumerate(tier_entries, start=1)
+        ]
+        return HighscoresSummary(
+            title="Overall Tier Leaders",
+            description="Current overall CA tier and total points by account.",
+            entries=entries,
+            empty_text="No overall progress data has been recorded yet.",
+        )
+
+    def get_boss_image_mappings(self) -> list[BossImageMapping]:
+        with self.db.connection() as conn:
+            rows = self.db.get_catalog_boss_image_mappings(conn)
+
+        mappings: list[BossImageMapping] = []
+        for row in rows:
+            npc = str(row.get("npc") or "").strip()
+            if not npc:
+                continue
+            npc_url = str(row.get("npc_url") or "").strip() or None
+            stored_image_url = str(row.get("npc_image_url") or "").strip() or None
+            mappings.append(
+                BossImageMapping(
+                    npc=npc,
+                    npc_url=npc_url,
+                    npc_image_url=_infer_npc_image_url(npc_url, npc) or stored_image_url,
+                    task_count=int(row.get("task_count") or 0),
+                )
+            )
+        return mappings
 
     def _award_tier_promotion_rerolls_if_due(
         self,
@@ -871,6 +1109,7 @@ class SyncService:
                 active_rsn = str(active["rsn"]).strip()
                 active_task_id = int(active["task_id"])
                 completion_state = self.db.get_task_completion_state(conn, active_rsn, active_task_id)
+                active_incomplete_ids = self.db.get_incomplete_task_ids(conn, active_rsn)
                 claimed_ids = self.db.get_claimed_task_ids_for_scan(
                     conn,
                     discord_user_id=discord_user_id,
@@ -878,13 +1117,13 @@ class SyncService:
                     scan_run_id=latest_scan_id,
                 )
                 eligible_ids = compute_eligible_task_ids(
-                    self.db.get_incomplete_task_ids(conn, active_rsn),
+                    active_incomplete_ids,
                     claimed_ids,
                 )
                 eligible_ids = self._filter_assignable_task_ids(
                     conn,
                     eligible_ids,
-                    incomplete_ids=self.db.get_incomplete_task_ids(conn, active_rsn),
+                    incomplete_ids=active_incomplete_ids,
                     current_tier_rank=current_tier_rank,
                 )
                 if (
@@ -894,7 +1133,7 @@ class SyncService:
                 ):
                     return ActiveTaskAssignment(
                         rsn=active_rsn,
-                        task=self._build_task_result(conn, active_task_id, len(eligible_ids)),
+                        task=self._build_task_result(conn, active_task_id, len(active_incomplete_ids)),
                         reused_existing=True,
                     )
                 self.db.clear_active_task(conn, discord_user_id, rsn)
@@ -927,7 +1166,7 @@ class SyncService:
             conn.commit()
             return ActiveTaskAssignment(
                 rsn=rsn,
-                task=self._build_task_result(conn, task_id, len(eligible_ids)),
+                task=self._build_task_result(conn, task_id, len(incomplete_ids)),
                 reused_existing=False,
             )
 
@@ -948,7 +1187,11 @@ class SyncService:
             active_tasks = [
                 ActiveTaskSummary(
                     rsn=str(row["rsn"]).strip(),
-                    task=self._build_task_result(conn, int(row["task_id"]), eligible_count=0),
+                    task=self._build_task_result(
+                        conn,
+                        int(row["task_id"]),
+                        eligible_count=len(self.db.get_incomplete_task_ids(conn, str(row["rsn"]).strip())),
+                    ),
                 )
                 for row in self.db.get_active_tasks(conn, discord_user_id)
             ]
@@ -1042,7 +1285,6 @@ class SyncService:
 
             active_rsn = str(active["rsn"]).strip()
             task_id = int(active["task_id"])
-            task = self._build_task_result(conn, task_id, eligible_count=0)
 
             try:
                 latest_scan_id = self.db.get_latest_completed_scan_run_id(conn)
@@ -1131,6 +1373,8 @@ class SyncService:
                 conn.commit()
             rerolls_available, _reward_batches = self._get_user_profile_snapshot(conn, discord_user_id)
             verified_assigned_completions = self.db.count_verified_task_claims(conn, discord_user_id)
+            remaining_count = self.db.get_progress_summary(conn, active_rsn)["incomplete_count"]
+            task = self._build_task_result(conn, task_id, remaining_count)
 
         return CompletionResult(
             rsn=active_rsn,
@@ -1171,7 +1415,7 @@ class SyncService:
                 incomplete_ids=incomplete_ids,
                 current_tier_rank=current_tier_rank,
             )
-            current_task = self._build_task_result(conn, task_id, len(eligible_ids))
+            current_task = self._build_task_result(conn, task_id, len(incomplete_ids))
             metadata_by_id = self.db.get_task_metadata_for_ids(conn, sorted(set(eligible_ids) | {task_id}))
             candidates = filter_reroll_candidate_ids(
                 task_id,
@@ -1217,7 +1461,7 @@ class SyncService:
             )
             conn.commit()
 
-            replacement = self._build_task_result(conn, next_task_id, len(candidates))
+            replacement = self._build_task_result(conn, next_task_id, len(incomplete_ids))
             return RerollResult(
                 rsn=rsn,
                 previous_task=current_task,

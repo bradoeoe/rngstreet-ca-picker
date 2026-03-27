@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
@@ -444,6 +445,23 @@ class Database:
         rows = cursor.fetchall()
         return {int(row["task_id"]): row for row in rows}
 
+    def get_catalog_boss_image_mappings(self, conn: MySQLConnection) -> list[dict]:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            f"""
+            SELECT
+                npc,
+                MAX(NULLIF(TRIM(COALESCE(npc_url, '')), '')) AS npc_url,
+                MAX(NULLIF(TRIM(COALESCE(npc_image_url, '')), '')) AS npc_image_url,
+                COUNT(*) AS task_count
+            FROM {TASK_CATALOG_TABLE}
+            WHERE TRIM(COALESCE(npc, '')) <> ''
+            GROUP BY npc
+            ORDER BY npc ASC
+            """
+        )
+        return list(cursor.fetchall())
+
     def get_task_completion_state(self, conn: MySQLConnection, rsn: str, task_id: int) -> bool | None:
         cursor = conn.cursor()
         cursor.execute(
@@ -819,6 +837,64 @@ class Database:
                 continue
             counts[rsn_value] = int(count or 0)
         return counts
+
+    def get_verified_claim_leaderboard(
+        self,
+        conn: MySQLConnection,
+        *,
+        limit: int | None = 10,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+    ) -> list[dict]:
+        cursor = conn.cursor(dictionary=True)
+        query = f"""
+            SELECT
+                claims.rsn,
+                COUNT(*) AS verified_tasks,
+                SUM(COALESCE(catalog.points, 0)) AS verified_points,
+                MAX(claims.last_verified_at) AS last_verified_at
+            FROM {TASK_CLAIMS_TABLE} AS claims
+            LEFT JOIN {TASK_CATALOG_TABLE} AS catalog
+              ON catalog.task_id = claims.task_id
+            WHERE claims.status = 'verified_complete'
+        """
+        params: list[object] = []
+        if start_at is not None:
+            query += " AND claims.last_verified_at >= %s"
+            params.append(start_at)
+        if end_at is not None:
+            query += " AND claims.last_verified_at < %s"
+            params.append(end_at)
+        query += """
+            GROUP BY claims.rsn
+            ORDER BY verified_points DESC, verified_tasks DESC, claims.rsn ASC
+        """
+        if limit is not None:
+            query += " LIMIT %s"
+            params.append(int(limit))
+        cursor.execute(query, tuple(params))
+        return list(cursor.fetchall())
+
+    def get_progress_leaderboard(self, conn: MySQLConnection, *, limit: int | None = 10) -> list[dict]:
+        cursor = conn.cursor(dictionary=True)
+        query = f"""
+            SELECT
+                progress.rsn,
+                SUM(CASE WHEN progress.is_complete = 1 THEN 1 ELSE 0 END) AS completed_tasks,
+                SUM(CASE WHEN progress.is_complete = 1 THEN COALESCE(catalog.points, 0) ELSE 0 END) AS total_points
+            FROM {PROGRESS_TABLE} AS progress
+            LEFT JOIN {TASK_CATALOG_TABLE} AS catalog
+              ON catalog.task_id = progress.task_id
+            GROUP BY progress.rsn
+            HAVING total_points > 0 OR completed_tasks > 0
+            ORDER BY total_points DESC, completed_tasks DESC, progress.rsn ASC
+        """
+        params: list[object] = []
+        if limit is not None:
+            query += " LIMIT %s"
+            params.append(int(limit))
+        cursor.execute(query, tuple(params))
+        return list(cursor.fetchall())
 
     def record_boss_completion_reroll_reward(
         self,
