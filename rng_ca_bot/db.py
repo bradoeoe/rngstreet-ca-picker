@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import secrets
+import string
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -26,6 +28,9 @@ ACTIVE_TASKS_TABLE = "ca_user_active_tasks"
 USER_TASK_PROFILES_TABLE = "ca_user_task_profiles"
 BOSS_COMPLETION_REWARDS_TABLE = "ca_boss_completion_reroll_rewards"
 RSN_TIER_REWARDS_TABLE = "ca_rsn_tier_rewards"
+REWARDS_TABLE = "ca_rewards"
+
+_REWARD_KEY_ALPHABET = string.ascii_uppercase + string.digits
 
 PREFIX_RENAMES: tuple[tuple[str, str], ...] = (
     ("scan_runs", SCAN_RUNS_TABLE),
@@ -781,6 +786,377 @@ class Database:
                 newly_verified_claims.append((str(discord_user_id), task_id))
 
         return verified, corrected, newly_verified_claims
+
+    def _generate_reward_key(self) -> str:
+        parts = ["".join(secrets.choice(_REWARD_KEY_ALPHABET) for _ in range(4)) for _ in range(4)]
+        return f"RNGCA-{'-'.join(parts)}"
+
+    def get_reward_for_claim(
+        self,
+        conn: MySQLConnection,
+        discord_user_id: str,
+        rsn: str,
+        task_id: int,
+        *,
+        for_update: bool = False,
+    ) -> dict | None:
+        cursor = conn.cursor(dictionary=True)
+        query = f"""
+            SELECT
+                id,
+                reward_key,
+                discord_user_id,
+                rsn,
+                task_id,
+                status,
+                reward_tier,
+                reward_kind,
+                reward_label,
+                reward_amount,
+                reward_quantity,
+                reward_image_url,
+                payout_status,
+                payout_marked_at,
+                payout_marked_by,
+                payout_notes,
+                created_at,
+                verified_at,
+                used_at
+            FROM {REWARDS_TABLE}
+            WHERE discord_user_id = %s
+              AND rsn = %s
+              AND task_id = %s
+        """
+        if for_update:
+            query += " FOR UPDATE"
+        cursor.execute(query, (discord_user_id, rsn, int(task_id)))
+        return cursor.fetchone()
+
+    def ensure_reward_for_claim(
+        self,
+        conn: MySQLConnection,
+        discord_user_id: str,
+        rsn: str,
+        task_id: int,
+    ) -> dict:
+        existing = self.get_reward_for_claim(conn, discord_user_id, rsn, task_id, for_update=True)
+        if existing is not None:
+            return existing
+
+        for _ in range(10):
+            reward_key = self._generate_reward_key()
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    f"""
+                    INSERT INTO {REWARDS_TABLE} (
+                        reward_key,
+                        discord_user_id,
+                        rsn,
+                        task_id,
+                        status
+                    )
+                    VALUES (%s, %s, %s, %s, 'pending_verification')
+                    """,
+                    (reward_key, discord_user_id, rsn, int(task_id)),
+                )
+                created = self.get_reward_for_claim(conn, discord_user_id, rsn, task_id, for_update=True)
+                if created is None:
+                    raise RuntimeError(f"Could not reload reward row for {discord_user_id} {rsn} task {task_id}")
+                return created
+            except mysql.connector.IntegrityError:
+                existing = self.get_reward_for_claim(conn, discord_user_id, rsn, task_id, for_update=True)
+                if existing is not None:
+                    return existing
+
+        raise RuntimeError(f"Could not generate a unique reward key for {discord_user_id} {rsn} task {task_id}")
+
+    def update_reward_status_for_claim(
+        self,
+        conn: MySQLConnection,
+        discord_user_id: str,
+        rsn: str,
+        task_id: int,
+        *,
+        status: str,
+    ) -> dict | None:
+        cursor = conn.cursor()
+        if status == "ready":
+            cursor.execute(
+                f"""
+                UPDATE {REWARDS_TABLE}
+                SET status = 'ready',
+                    verified_at = COALESCE(verified_at, CURRENT_TIMESTAMP)
+                WHERE discord_user_id = %s
+                  AND rsn = %s
+                  AND task_id = %s
+                  AND status IN ('pending_verification', 'ready')
+                """,
+                (discord_user_id, rsn, int(task_id)),
+            )
+        elif status == "cancelled":
+            cursor.execute(
+                f"""
+                UPDATE {REWARDS_TABLE}
+                SET status = 'cancelled'
+                WHERE discord_user_id = %s
+                  AND rsn = %s
+                  AND task_id = %s
+                  AND status = 'pending_verification'
+                """,
+                (discord_user_id, rsn, int(task_id)),
+            )
+        else:
+            raise ValueError(f"Unsupported reward status: {status}")
+        return self.get_reward_for_claim(conn, discord_user_id, rsn, task_id)
+
+    def sync_reward_statuses_for_rsn(self, conn: MySQLConnection, rsn: str) -> tuple[int, int]:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            UPDATE {REWARDS_TABLE} rewards
+            JOIN {TASK_CLAIMS_TABLE} claims
+              ON claims.discord_user_id = rewards.discord_user_id
+             AND claims.rsn = rewards.rsn
+             AND claims.task_id = rewards.task_id
+            SET rewards.status = 'ready',
+                rewards.verified_at = COALESCE(rewards.verified_at, CURRENT_TIMESTAMP)
+            WHERE rewards.rsn = %s
+              AND rewards.status = 'pending_verification'
+              AND claims.status = 'verified_complete'
+            """,
+            (rsn,),
+        )
+        ready_count = cursor.rowcount
+
+        cursor.execute(
+            f"""
+            UPDATE {REWARDS_TABLE} rewards
+            JOIN {TASK_CLAIMS_TABLE} claims
+              ON claims.discord_user_id = rewards.discord_user_id
+             AND claims.rsn = rewards.rsn
+             AND claims.task_id = rewards.task_id
+            SET rewards.status = 'cancelled'
+            WHERE rewards.rsn = %s
+              AND rewards.status = 'pending_verification'
+              AND claims.status = 'corrected_incomplete'
+            """,
+            (rsn,),
+        )
+        cancelled_count = cursor.rowcount
+        return ready_count, cancelled_count
+
+    def get_reward_by_key(
+        self,
+        conn: MySQLConnection,
+        reward_key: str,
+        *,
+        for_update: bool = False,
+    ) -> dict | None:
+        cursor = conn.cursor(dictionary=True)
+        query = f"""
+            SELECT
+                id,
+                reward_key,
+                discord_user_id,
+                rsn,
+                task_id,
+                status,
+                reward_tier,
+                reward_kind,
+                reward_label,
+                reward_amount,
+                reward_quantity,
+                reward_image_url,
+                payout_status,
+                payout_marked_at,
+                payout_marked_by,
+                payout_notes,
+                created_at,
+                verified_at,
+                used_at
+            FROM {REWARDS_TABLE}
+            WHERE reward_key = %s
+        """
+        if for_update:
+            query += " FOR UPDATE"
+        cursor.execute(query, (reward_key,))
+        return cursor.fetchone()
+
+    def redeem_reward_key(
+        self,
+        conn: MySQLConnection,
+        reward_key: str,
+        *,
+        reward_tier: str,
+        reward_kind: str,
+        reward_label: str,
+        reward_amount: int | None,
+        reward_quantity: int | None,
+        reward_image_url: str | None,
+    ) -> dict | None:
+        reward = self.get_reward_by_key(conn, reward_key, for_update=True)
+        if reward is None:
+            return None
+
+        if str(reward.get("status") or "").strip() != "ready":
+            return reward
+
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            UPDATE {REWARDS_TABLE}
+            SET status = 'redeemed',
+                reward_tier = %s,
+                reward_kind = %s,
+                reward_label = %s,
+                reward_amount = %s,
+                reward_quantity = %s,
+                reward_image_url = %s,
+                payout_status = 'unpaid',
+                payout_marked_at = NULL,
+                payout_marked_by = NULL,
+                payout_notes = NULL,
+                used_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+              AND status = 'ready'
+            """,
+            (
+                reward_tier,
+                reward_kind,
+                reward_label,
+                int(reward_amount) if reward_amount is not None else None,
+                int(reward_quantity) if reward_quantity is not None else None,
+                reward_image_url,
+                int(reward["id"]),
+            ),
+        )
+        return self.get_reward_by_key(conn, reward_key, for_update=True)
+
+    def list_reward_payouts(
+        self,
+        conn: MySQLConnection,
+        *,
+        payout_status: str | None = "unpaid",
+        limit: int = 200,
+    ) -> list[dict]:
+        normalized_status = (payout_status or "unpaid").strip().casefold()
+        if normalized_status not in {"unpaid", "paid", "all"}:
+            raise ValueError(f"Unsupported payout status: {payout_status}")
+
+        query = f"""
+            SELECT
+                id,
+                reward_key,
+                discord_user_id,
+                rsn,
+                task_id,
+                status,
+                reward_tier,
+                reward_kind,
+                reward_label,
+                reward_amount,
+                reward_quantity,
+                reward_image_url,
+                payout_status,
+                payout_marked_at,
+                payout_marked_by,
+                payout_notes,
+                created_at,
+                verified_at,
+                used_at
+            FROM {REWARDS_TABLE}
+            WHERE status = 'redeemed'
+        """
+        params: list[object] = []
+        if normalized_status != "all":
+            query += " AND payout_status = %s"
+            params.append(normalized_status)
+
+        query += """
+            ORDER BY
+                CASE payout_status WHEN 'unpaid' THEN 0 ELSE 1 END,
+                used_at DESC,
+                id DESC
+            LIMIT %s
+        """
+        params.append(max(int(limit), 1))
+
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(query, tuple(params))
+        return list(cursor.fetchall())
+
+    def get_reward_payout_counts(self, conn: MySQLConnection) -> dict[str, int]:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT payout_status, COUNT(*)
+            FROM {REWARDS_TABLE}
+            WHERE status = 'redeemed'
+            GROUP BY payout_status
+            """
+        )
+        counts = {"unpaid": 0, "paid": 0}
+        for payout_status, count in cursor.fetchall():
+            key = str(payout_status or "").strip().casefold()
+            if key in counts:
+                counts[key] = int(count or 0)
+        counts["all"] = counts["unpaid"] + counts["paid"]
+        return counts
+
+    def update_reward_payout_status(
+        self,
+        conn: MySQLConnection,
+        reward_key: str,
+        *,
+        payout_status: str,
+        marked_by: str | None = None,
+        notes: str | None = None,
+    ) -> dict | None:
+        normalized_status = payout_status.strip().casefold()
+        if normalized_status not in {"unpaid", "paid"}:
+            raise ValueError(f"Unsupported payout status: {payout_status}")
+
+        reward = self.get_reward_by_key(conn, reward_key, for_update=True)
+        if reward is None:
+            return None
+        if str(reward.get("status") or "").strip() != "redeemed":
+            return reward
+
+        cursor = conn.cursor()
+        if normalized_status == "paid":
+            cursor.execute(
+                f"""
+                UPDATE {REWARDS_TABLE}
+                SET payout_status = 'paid',
+                    payout_marked_at = CURRENT_TIMESTAMP,
+                    payout_marked_by = %s,
+                    payout_notes = %s
+                WHERE id = %s
+                """,
+                (
+                    (marked_by or "").strip() or None,
+                    (notes or "").strip() or None,
+                    int(reward["id"]),
+                ),
+            )
+        else:
+            cursor.execute(
+                f"""
+                UPDATE {REWARDS_TABLE}
+                SET payout_status = 'unpaid',
+                    payout_marked_at = NULL,
+                    payout_marked_by = %s,
+                    payout_notes = %s
+                WHERE id = %s
+                """,
+                (
+                    (marked_by or "").strip() or None,
+                    (notes or "").strip() or None,
+                    int(reward["id"]),
+                ),
+            )
+        return self.get_reward_by_key(conn, reward_key, for_update=True)
 
     def count_verified_task_claims(self, conn: MySQLConnection, discord_user_id: str) -> int:
         cursor = conn.cursor()

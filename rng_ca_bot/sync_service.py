@@ -15,6 +15,7 @@ import requests
 
 from .config import Settings
 from .db import Database, ScanRunResult, TaskCatalogEntry, completed_scan_status
+from .rewards import format_reward_display
 
 LOGGER = logging.getLogger(__name__)
 
@@ -114,6 +115,8 @@ class RerollResult:
 class CompletionResult:
     rsn: str
     task: RandomTaskResult
+    reward_key: str | None
+    reward_status: str | None
     rerolls_remaining: int
     awarded_rerolls: int
     verified_assigned_completions: int
@@ -188,6 +191,28 @@ class BossImageMapping:
     npc_url: str | None
     npc_image_url: str | None
     task_count: int
+
+
+@dataclass(slots=True)
+class RewardPayoutEntry:
+    reward_key: str
+    rsn: str
+    reward_label: str
+    reward_display_value: str
+    reward_tier: str
+    payout_status: str
+    redeemed_at: datetime | None
+    payout_marked_at: datetime | None
+    payout_marked_by: str | None
+    payout_notes: str | None
+
+
+@dataclass(slots=True)
+class RewardPayoutSummary:
+    unpaid_count: int
+    paid_count: int
+    unpaid_entries: list[RewardPayoutEntry]
+    recent_paid_entries: list[RewardPayoutEntry]
 
 
 class RuneLiteSyncError(Exception):
@@ -588,6 +613,7 @@ class SyncService:
                             completed_task_ids=completed_ids,
                             scan_run_id=run_id,
                         )
+                        self.db.sync_reward_statuses_for_rsn(conn, rsn)
                         mapped_discord_user_id = self.db.get_primary_discord_user_id_for_rsn(conn, rsn)
                         if mapped_discord_user_id:
                             self._award_tier_promotion_rerolls_if_due(
@@ -1054,6 +1080,120 @@ class SyncService:
             )
         return mappings
 
+    def _build_reward_payout_entry(self, row: Mapping[str, object]) -> RewardPayoutEntry:
+        reward_label = str(row.get("reward_label") or "").strip()
+        reward_amount = int(row.get("reward_amount") or 0) or None
+        reward_quantity = int(row.get("reward_quantity") or 0) or None
+        reward_kind = str(row.get("reward_kind") or "").strip().casefold() or ("gp" if reward_amount else "item")
+        reward_display_value = format_reward_display(
+            kind=reward_kind,
+            label=reward_label,
+            amount=reward_amount,
+            quantity=reward_quantity,
+        )
+        reward_tier = str(row.get("reward_tier") or "").strip().title() or "Unknown"
+        payout_status = str(row.get("payout_status") or "").strip().casefold() or "unpaid"
+        redeemed_at = row.get("used_at")
+        payout_marked_at = row.get("payout_marked_at")
+        payout_marked_by = str(row.get("payout_marked_by") or "").strip() or None
+        payout_notes = str(row.get("payout_notes") or "").strip() or None
+        return RewardPayoutEntry(
+            reward_key=str(row.get("reward_key") or "").strip(),
+            rsn=str(row.get("rsn") or "").strip(),
+            reward_label=reward_label or reward_display_value,
+            reward_display_value=reward_display_value,
+            reward_tier=reward_tier,
+            payout_status=payout_status,
+            redeemed_at=redeemed_at if isinstance(redeemed_at, datetime) else None,
+            payout_marked_at=payout_marked_at if isinstance(payout_marked_at, datetime) else None,
+            payout_marked_by=payout_marked_by,
+            payout_notes=payout_notes,
+        )
+
+    def get_reward_payout_summary(
+        self,
+        *,
+        unpaid_limit: int = 12,
+        paid_limit: int = 8,
+    ) -> RewardPayoutSummary:
+        with self.db.connection() as conn:
+            counts = self.db.get_reward_payout_counts(conn)
+            unpaid_rows = self.db.list_reward_payouts(conn, payout_status="unpaid", limit=unpaid_limit)
+            paid_rows = self.db.list_reward_payouts(conn, payout_status="paid", limit=paid_limit)
+
+        return RewardPayoutSummary(
+            unpaid_count=int(counts.get("unpaid") or 0),
+            paid_count=int(counts.get("paid") or 0),
+            unpaid_entries=[self._build_reward_payout_entry(row) for row in unpaid_rows],
+            recent_paid_entries=[self._build_reward_payout_entry(row) for row in paid_rows],
+        )
+
+    def mark_reward_paid(
+        self,
+        reward_key: str,
+        *,
+        actor: str | None = None,
+        notes: str | None = None,
+    ) -> RewardPayoutEntry | None:
+        normalized_key = reward_key.strip().upper()
+        if not normalized_key:
+            return None
+
+        with self.db.connection() as conn:
+            try:
+                row = self.db.update_reward_payout_status(
+                    conn,
+                    normalized_key,
+                    payout_status="paid",
+                    marked_by=actor,
+                    notes=notes,
+                )
+                if row is None:
+                    conn.rollback()
+                    return None
+                if str(row.get("status") or "").strip() != "redeemed":
+                    conn.rollback()
+                    return None
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        return self._build_reward_payout_entry(row)
+
+    def mark_reward_unpaid(
+        self,
+        reward_key: str,
+        *,
+        actor: str | None = None,
+        notes: str | None = None,
+    ) -> RewardPayoutEntry | None:
+        normalized_key = reward_key.strip().upper()
+        if not normalized_key:
+            return None
+
+        with self.db.connection() as conn:
+            try:
+                row = self.db.update_reward_payout_status(
+                    conn,
+                    normalized_key,
+                    payout_status="unpaid",
+                    marked_by=actor,
+                    notes=notes,
+                )
+                if row is None:
+                    conn.rollback()
+                    return None
+                if str(row.get("status") or "").strip() != "redeemed":
+                    conn.rollback()
+                    return None
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        return self._build_reward_payout_entry(row)
+
     def _award_tier_promotion_rerolls_if_due(
         self,
         conn,
@@ -1278,6 +1418,8 @@ class SyncService:
         message_id: str | None,
     ) -> CompletionResult | None:
         task: RandomTaskResult
+        reward_key: str | None = None
+        reward_status: str | None = None
         with self.db.connection() as conn:
             active = self.db.get_active_task(conn, discord_user_id, rsn)
             if active is None:
@@ -1306,6 +1448,17 @@ class SyncService:
                     channel_id=channel_id,
                     message_id=message_id,
                 )
+                reward = self.db.ensure_reward_for_claim(conn, discord_user_id, active_rsn, task_id)
+                if not self.settings.reward_keys_require_verification:
+                    reward = self.db.update_reward_status_for_claim(
+                        conn,
+                        discord_user_id,
+                        active_rsn,
+                        task_id,
+                        status="ready",
+                    ) or reward
+                reward_key = str(reward.get("reward_key") or "").strip() or None
+                reward_status = str(reward.get("status") or "").strip() or None
                 self.db.clear_active_task(conn, discord_user_id, active_rsn)
                 conn.commit()
             except Exception:
@@ -1340,6 +1493,26 @@ class SyncService:
                             is_complete=True,
                             verified_scan_run_id=latest_scan_id,
                         )
+                        if claim_status == "verified_complete":
+                            reward = self.db.update_reward_status_for_claim(
+                                conn,
+                                discord_user_id,
+                                active_rsn,
+                                task_id,
+                                status="ready",
+                            )
+                            if reward is not None:
+                                reward_status = str(reward.get("status") or "").strip() or reward_status
+                        elif claim_status == "corrected_incomplete":
+                            reward = self.db.update_reward_status_for_claim(
+                                conn,
+                                discord_user_id,
+                                active_rsn,
+                                task_id,
+                                status="cancelled",
+                            )
+                            if reward is not None:
+                                reward_status = str(reward.get("status") or "").strip() or reward_status
                         if claim_status == "verified_complete" and previous_status != "verified_complete":
                             completion_bonus, _, _ = self._award_due_rerolls(conn, discord_user_id)
                             boss_bonus = self._award_boss_completion_reroll_if_due(
@@ -1375,10 +1548,16 @@ class SyncService:
             verified_assigned_completions = self.db.count_verified_task_claims(conn, discord_user_id)
             remaining_count = self.db.get_progress_summary(conn, active_rsn)["incomplete_count"]
             task = self._build_task_result(conn, task_id, remaining_count)
+            reward = self.db.get_reward_for_claim(conn, discord_user_id, active_rsn, task_id)
+            if reward is not None:
+                reward_key = str(reward.get("reward_key") or "").strip() or reward_key
+                reward_status = str(reward.get("status") or "").strip() or reward_status
 
         return CompletionResult(
             rsn=active_rsn,
             task=task,
+            reward_key=reward_key,
+            reward_status=reward_status,
             rerolls_remaining=rerolls_available,
             awarded_rerolls=awarded_rerolls,
             verified_assigned_completions=verified_assigned_completions,
@@ -1499,6 +1678,22 @@ class SyncService:
                     is_complete=is_complete,
                     verified_scan_run_id=latest_scan_id,
                 )
+                if claim_status == "verified_complete":
+                    self.db.update_reward_status_for_claim(
+                        conn,
+                        discord_user_id,
+                        rsn,
+                        task_id,
+                        status="ready",
+                    )
+                elif claim_status == "corrected_incomplete":
+                    self.db.update_reward_status_for_claim(
+                        conn,
+                        discord_user_id,
+                        rsn,
+                        task_id,
+                        status="cancelled",
+                    )
                 if claim_status == "verified_complete" and previous_status != "verified_complete":
                     self._award_due_rerolls(conn, discord_user_id)
                     self._award_boss_completion_reroll_if_due(

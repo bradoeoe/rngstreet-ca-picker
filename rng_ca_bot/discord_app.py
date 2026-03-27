@@ -16,6 +16,8 @@ from .sync_service import (
     BossImageMapping,
     CompletionResult,
     HighscoresSummary,
+    RewardPayoutEntry,
+    RewardPayoutSummary,
     RandomTaskResult,
     RerollResult,
     SyncService,
@@ -26,6 +28,7 @@ LOGGER = logging.getLogger(__name__)
 
 PANEL_KEY = "global_task_panel"
 HIGHSCORES_PANEL_KEY = "global_highscores_panel"
+PAYOUTS_PANEL_KEY = "reward_payouts_panel"
 GET_TASK_CUSTOM_ID = "rngca:panel:get_task"
 REROLL_CUSTOM_ID = "rngca:panel:reroll"
 COMPLETE_TASK_CUSTOM_ID = "rngca:panel:complete_task"
@@ -33,6 +36,9 @@ PROFILE_CUSTOM_ID = "rngca:panel:profile"
 MONTHLY_HIGHSCORES_CUSTOM_ID = "rngca:highscores:monthly"
 ALL_TIME_HIGHSCORES_CUSTOM_ID = "rngca:highscores:all_time"
 OVERALL_TIER_LEADERS_CUSTOM_ID = "rngca:highscores:tier_leaders"
+PAYOUTS_REFRESH_CUSTOM_ID = "rngca:payouts:refresh"
+PAYOUTS_MARK_PAID_CUSTOM_ID = "rngca:payouts:mark_paid"
+PAYOUTS_UNDO_PAID_CUSTOM_ID = "rngca:payouts:undo_paid"
 
 ACTION_GET = "get_task"
 ACTION_REROLL = "reroll"
@@ -42,6 +48,7 @@ HIGHSCORES_MODE_MONTHLY = "monthly"
 HIGHSCORES_MODE_ALL_TIME = "all_time"
 HIGHSCORES_MODE_TIER_LEADERS = "tier_leaders"
 HIGHSCORES_PAGE_SIZE = 20
+PAYOUTS_REFRESH_INTERVAL_SECONDS = 60
 
 
 @dataclass(slots=True)
@@ -53,6 +60,22 @@ def _truncate_text(value: str, max_len: int) -> str:
     if len(value) <= max_len:
         return value
     return value[: max_len - 3].rstrip() + "..."
+
+
+def _discord_relative_timestamp(value: datetime | None) -> str:
+    if value is None:
+        return "unknown time"
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    unix = int(value.timestamp())
+    return f"<t:{unix}:R>"
+
+
+def _compact_reward_key(reward_key: str) -> str:
+    cleaned = reward_key.strip()
+    if len(cleaned) <= 14:
+        return cleaned
+    return f"{cleaned[:10]}...{cleaned[-4:]}"
 
 
 def _audit_log(interaction: discord.Interaction, event: str, **fields: object) -> None:
@@ -101,7 +124,28 @@ def _task_color(points: int | None, tier_label: str | None) -> discord.Color:
     return discord.Color.blurple()
 
 
-def _task_embed(rsn: str, task: RandomTaskResult) -> discord.Embed:
+def _reward_status_label(status: str | None) -> str | None:
+    normalized = (status or "").strip().casefold()
+    if not normalized:
+        return None
+    if normalized == "ready":
+        return "Ready to redeem"
+    if normalized == "pending_verification":
+        return "Pending verification"
+    if normalized == "redeemed":
+        return "Redeemed"
+    if normalized == "cancelled":
+        return "Cancelled"
+    return status
+
+
+def _task_embed(
+    rsn: str,
+    task: RandomTaskResult,
+    *,
+    reward_key: str | None = None,
+    reward_status: str | None = None,
+) -> discord.Embed:
     embed = discord.Embed(
         title=task.task_name,
         description=_truncate_text(task.task_description or "No description available.", 4096),
@@ -122,6 +166,10 @@ def _task_embed(rsn: str, task: RandomTaskResult) -> discord.Embed:
         value=f"**{max(task.eligible_count, 0)}**",
         inline=False,
     )
+    if reward_key:
+        embed.add_field(name="Reward Key", value=f"`{reward_key}`", inline=False)
+    if reward_status:
+        embed.add_field(name="Reward Status", value=_reward_status_label(reward_status) or reward_status, inline=True)
     if task.npc_image_url:
         embed.set_thumbnail(url=task.npc_image_url)
     embed.set_footer(text=f"Combat Task Tracker • {rsn}")
@@ -224,6 +272,59 @@ def _highscores_embed(
     return embed
 
 
+def _reward_payout_status_line(entry: RewardPayoutEntry, *, paid: bool) -> str:
+    if paid:
+        paid_by = entry.payout_marked_by or "Unknown admin"
+        paid_at = _discord_relative_timestamp(entry.payout_marked_at)
+        return (
+            f"`{entry.rsn}` • **{entry.reward_display_value}**\n"
+            f"Paid by **{paid_by}** {paid_at}"
+        )
+
+    return (
+        f"`{entry.rsn}` • **{entry.reward_display_value}** • `{_compact_reward_key(entry.reward_key)}`\n"
+        f"Redeemed {_discord_relative_timestamp(entry.redeemed_at)}"
+    )
+
+
+def _reward_payouts_embed(summary: RewardPayoutSummary) -> discord.Embed:
+    has_unpaid = summary.unpaid_count > 0
+    color = discord.Color.orange() if has_unpaid else discord.Color.green()
+    embed = discord.Embed(
+        title="Reward Payout Board",
+        description="Redeemed reward keys waiting on manual payout. Keep this in an admin-only channel.",
+        color=color,
+        timestamp=datetime.now(UTC),
+    )
+    embed.add_field(name="Needs Payout", value=f"**{summary.unpaid_count}**", inline=True)
+    embed.add_field(name="Paid Out", value=f"**{summary.paid_count}**", inline=True)
+    embed.add_field(name="Updated", value=_discord_relative_timestamp(datetime.now(UTC)), inline=True)
+
+    if summary.unpaid_entries:
+        unpaid_lines = [_reward_payout_status_line(entry, paid=False) for entry in summary.unpaid_entries]
+        embed.add_field(
+            name="Waiting Now",
+            value=_truncate_text("\n\n".join(unpaid_lines), 1024),
+            inline=False,
+        )
+    else:
+        embed.add_field(name="Waiting Now", value="Nothing is waiting on payout right now.", inline=False)
+
+    if summary.recent_paid_entries:
+        paid_lines = [_reward_payout_status_line(entry, paid=True) for entry in summary.recent_paid_entries]
+        embed.add_field(
+            name="Recently Paid",
+            value=_truncate_text("\n\n".join(paid_lines), 1024),
+            inline=False,
+        )
+    else:
+        embed.add_field(name="Recently Paid", value="No paid rewards have been recorded yet.", inline=False)
+
+    footer = "Use Refresh or Mark Paid below. The board refreshes automatically every minute."
+    embed.set_footer(text=footer)
+    return embed
+
+
 def _action_human_name(action: str) -> str:
     if action == ACTION_GET:
         return "Get Task"
@@ -299,13 +400,20 @@ async def _refresh_highscores_panel(bot: "RngCABot") -> None:
         LOGGER.exception("Could not refresh highscores panel after completion")
 
 
+async def _refresh_reward_payouts_panel(bot: "RngCABot") -> None:
+    try:
+        await bot.ensure_reward_payouts_panel_message()
+    except Exception:
+        LOGGER.exception("Could not refresh reward payouts panel")
+
+
 def _active_task_message_payload(
     bot: "RngCABot",
     *,
     owner_user_id: str,
     rsn: str,
     task: RandomTaskResult,
-    content: str,
+    content: str | None = None,
 ) -> dict[str, object]:
     return {
         "content": content,
@@ -313,43 +421,12 @@ def _active_task_message_payload(
         "view": AssignedTaskView(bot, owner_user_id=owner_user_id, rsn=rsn),
     }
 
-
-def _completion_response_content(completed: CompletionResult) -> str:
-    if completed.live_verified:
-        if completed.awarded_rerolls > 0:
-            reroll_label = "reroll" if completed.awarded_rerolls == 1 else "rerolls"
-            reward_line = (
-                f" You earned **{completed.awarded_rerolls}** {reroll_label} and now have "
-                f"**{completed.rerolls_remaining}** available."
-            )
-        else:
-            reward_line = f" You now have **{completed.rerolls_remaining}** rerolls available."
-        return (
-            f"Verified completion for `{completed.rsn}`: **{completed.task.task_name}** "
-            f"(`ID {completed.task.task_id}`).{reward_line} Click **Get Task** on the board for your next one."
-        )
-
-    if completed.live_verification_attempted:
-        return (
-            f"Recorded completion claim for `{completed.rsn}`: **{completed.task.task_name}** "
-            f"(`ID {completed.task.task_id}`). Live lookup did not confirm it yet, "
-            "so it will be checked again during the next daily scan."
-        )
-
-    return (
-        f"Recorded completion claim for `{completed.rsn}`: **{completed.task.task_name}** "
-        f"(`ID {completed.task.task_id}`). Live verification was unavailable just now, "
-        "so the daily scan will reconcile it later."
-    )
-
-
 async def _send_assignment_response(
     bot: "RngCABot",
     interaction: discord.Interaction,
     owner_user_id: str,
     assignment: ActiveTaskAssignment,
 ) -> None:
-    headline = "Current active task" if assignment.reused_existing else "New task assigned"
     await _send_ephemeral_followup(
         interaction,
         **_active_task_message_payload(
@@ -357,7 +434,6 @@ async def _send_assignment_response(
             owner_user_id=owner_user_id,
             rsn=assignment.rsn,
             task=assignment.task,
-            content=f"{headline} for `{assignment.rsn}`:",
         ),
     )
 
@@ -441,6 +517,8 @@ async def _run_panel_action(
             rsn=completed.rsn,
             task_id=completed.task.task_id,
             task_name=completed.task.task_name,
+            reward_key=completed.reward_key,
+            reward_status=completed.reward_status,
             live_verified=completed.live_verified,
             live_verification_attempted=completed.live_verification_attempted,
             awarded_rerolls=completed.awarded_rerolls,
@@ -448,7 +526,12 @@ async def _run_panel_action(
         )
         await _send_ephemeral_followup(
             interaction,
-            content=_completion_response_content(completed),
+            embed=_task_embed(
+                completed.rsn,
+                completed.task,
+                reward_key=completed.reward_key,
+                reward_status=completed.reward_status,
+            ),
         )
         return
 
@@ -557,6 +640,10 @@ def _load_highscores_summary(bot: "RngCABot", mode: str) -> HighscoresSummary:
     if mode == HIGHSCORES_MODE_TIER_LEADERS:
         return bot.services.sync_service.get_overall_tier_leaders_summary()
     return bot.services.sync_service.get_monthly_highscores_summary()
+
+
+def _load_reward_payout_summary(bot: "RngCABot") -> RewardPayoutSummary:
+    return bot.services.sync_service.get_reward_payout_summary()
 
 
 def _find_highscores_entry(summary: HighscoresSummary, rsn: str):
@@ -764,10 +851,6 @@ class AssignedTaskView(discord.ui.View):
                 owner_user_id=self.owner_user_id,
                 rsn=self.rsn,
                 task=result.replacement_task,
-                content=(
-                    f"Rerolled `{self.rsn}` from **{result.previous_task.task_name}** "
-                    f"to a new task. Rerolls left: **{result.rerolls_remaining}**."
-                ),
             ),
         )
 
@@ -813,14 +896,21 @@ class AssignedTaskView(discord.ui.View):
             rsn=completed.rsn,
             task_id=completed.task.task_id,
             task_name=completed.task.task_name,
+            reward_key=completed.reward_key,
+            reward_status=completed.reward_status,
             live_verified=completed.live_verified,
             live_verification_attempted=completed.live_verification_attempted,
             awarded_rerolls=completed.awarded_rerolls,
             rerolls_remaining=completed.rerolls_remaining,
         )
         await interaction.response.edit_message(
-            content=_completion_response_content(completed),
-            embed=_task_embed(completed.rsn, completed.task),
+            content=None,
+            embed=_task_embed(
+                completed.rsn,
+                completed.task,
+                reward_key=completed.reward_key,
+                reward_status=completed.reward_status,
+            ),
             view=None,
         )
 
@@ -1114,6 +1204,225 @@ class HighscoresBrowserView(discord.ui.View):
         await self._go_to(interaction, page=min(self.page + 1, self.total_pages - 1))
 
 
+class RewardPayoutMarkPaidPickerView(discord.ui.View):
+    def __init__(
+        self,
+        bot: "RngCABot",
+        *,
+        owner_user_id: str,
+        unpaid_entries: Sequence[RewardPayoutEntry],
+    ) -> None:
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.owner_user_id = owner_user_id
+        trimmed = list(unpaid_entries)[:25]
+        self.truncated_count = max(len(unpaid_entries) - len(trimmed), 0)
+        self.unpaid_entries = {entry.reward_key: entry for entry in trimmed}
+
+        options = [
+            discord.SelectOption(
+                label=_truncate_text(f"{entry.rsn} • {entry.reward_display_value}", 100),
+                value=entry.reward_key,
+                description=_truncate_text(f"{entry.reward_tier} • {_compact_reward_key(entry.reward_key)}", 100),
+            )
+            for entry in trimmed
+        ]
+        self.reward_select = discord.ui.Select(
+            placeholder="Choose reward to mark paid",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.reward_select.callback = self._select_callback
+        self.add_item(self.reward_select)
+
+    async def _select_callback(self, interaction: discord.Interaction) -> None:
+        if str(interaction.user.id) != self.owner_user_id:
+            await interaction.response.send_message("This payout selector belongs to another user.", ephemeral=True)
+            return
+
+        reward_key = self.reward_select.values[0]
+        try:
+            payout = await asyncio.to_thread(
+                self.bot.services.sync_service.mark_reward_paid,
+                reward_key,
+                actor=str(interaction.user),
+            )
+        except Exception:
+            LOGGER.exception("Could not mark reward %s as paid", reward_key)
+            await interaction.response.edit_message(
+                content="Could not mark that reward as paid right now.",
+                view=None,
+            )
+            return
+
+        if payout is None:
+            await interaction.response.edit_message(
+                content="That reward could not be marked as paid. It may have been updated already.",
+                view=None,
+            )
+            return
+
+        _audit_log(
+            interaction,
+            "reward_payout_mark_paid",
+            reward_key=payout.reward_key,
+            rsn=payout.rsn,
+            reward=payout.reward_display_value,
+        )
+        asyncio.create_task(_refresh_reward_payouts_panel(self.bot))
+        await interaction.response.edit_message(
+            content=f"Marked `{payout.rsn}` • **{payout.reward_display_value}** as paid.",
+            view=None,
+        )
+
+
+class RewardPayoutUndoPaidPickerView(discord.ui.View):
+    def __init__(
+        self,
+        bot: "RngCABot",
+        *,
+        owner_user_id: str,
+        paid_entries: Sequence[RewardPayoutEntry],
+    ) -> None:
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.owner_user_id = owner_user_id
+        trimmed = list(paid_entries)[:25]
+        self.truncated_count = max(len(paid_entries) - len(trimmed), 0)
+
+        options = [
+            discord.SelectOption(
+                label=_truncate_text(f"{entry.rsn} • {entry.reward_display_value}", 100),
+                value=entry.reward_key,
+                description=_truncate_text(
+                    f"Paid by {entry.payout_marked_by or 'Unknown'} • {_compact_reward_key(entry.reward_key)}",
+                    100,
+                ),
+            )
+            for entry in trimmed
+        ]
+        self.reward_select = discord.ui.Select(
+            placeholder="Choose paid reward to undo",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.reward_select.callback = self._select_callback
+        self.add_item(self.reward_select)
+
+    async def _select_callback(self, interaction: discord.Interaction) -> None:
+        if str(interaction.user.id) != self.owner_user_id:
+            await interaction.response.send_message("This payout selector belongs to another user.", ephemeral=True)
+            return
+
+        reward_key = self.reward_select.values[0]
+        try:
+            payout = await asyncio.to_thread(
+                self.bot.services.sync_service.mark_reward_unpaid,
+                reward_key,
+                actor=str(interaction.user),
+            )
+        except Exception:
+            LOGGER.exception("Could not undo payout for reward %s", reward_key)
+            await interaction.response.edit_message(
+                content="Could not undo that payout right now.",
+                view=None,
+            )
+            return
+
+        if payout is None:
+            await interaction.response.edit_message(
+                content="That reward could not be switched back to unpaid.",
+                view=None,
+            )
+            return
+
+        _audit_log(
+            interaction,
+            "reward_payout_undo_paid",
+            reward_key=payout.reward_key,
+            rsn=payout.rsn,
+            reward=payout.reward_display_value,
+        )
+        asyncio.create_task(_refresh_reward_payouts_panel(self.bot))
+        await interaction.response.edit_message(
+            content=f"Moved `{payout.rsn}` • **{payout.reward_display_value}** back to unpaid.",
+            view=None,
+        )
+
+
+class RewardPayoutPanelView(discord.ui.View):
+    def __init__(self, bot: "RngCABot", *, has_unpaid: bool = True, has_paid: bool = True) -> None:
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.mark_paid.disabled = not has_unpaid
+        self.undo_paid.disabled = not has_paid
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary, custom_id=PAYOUTS_REFRESH_CUSTOM_ID)
+    async def refresh(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        await _refresh_reward_payouts_panel(self.bot)
+        _audit_log(interaction, "reward_payouts_refresh")
+        await interaction.followup.send("Reward payout board refreshed.", ephemeral=True)
+
+    @discord.ui.button(label="Mark Paid", style=discord.ButtonStyle.success, custom_id=PAYOUTS_MARK_PAID_CUSTOM_ID)
+    async def mark_paid(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            summary = await asyncio.to_thread(
+                self.bot.services.sync_service.get_reward_payout_summary,
+                unpaid_limit=25,
+                paid_limit=8,
+            )
+        except Exception:
+            LOGGER.exception("Could not load reward payout summary for mark-paid flow")
+            await interaction.followup.send("Could not load payout entries right now.", ephemeral=True)
+            return
+
+        if not summary.unpaid_entries:
+            await interaction.followup.send("No unpaid rewards are waiting right now.", ephemeral=True)
+            return
+
+        picker = RewardPayoutMarkPaidPickerView(
+            self.bot,
+            owner_user_id=str(interaction.user.id),
+            unpaid_entries=summary.unpaid_entries,
+        )
+        notice = "Choose a redeemed reward to mark as paid:"
+        if picker.truncated_count > 0:
+            notice = f"Choose reward to mark paid (showing first 25, {picker.truncated_count} not shown):"
+        await interaction.followup.send(content=notice, view=picker, ephemeral=True)
+
+    @discord.ui.button(label="Undo Paid", style=discord.ButtonStyle.danger, custom_id=PAYOUTS_UNDO_PAID_CUSTOM_ID)
+    async def undo_paid(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            summary = await asyncio.to_thread(
+                self.bot.services.sync_service.get_reward_payout_summary,
+                unpaid_limit=12,
+                paid_limit=25,
+            )
+        except Exception:
+            LOGGER.exception("Could not load reward payout summary for undo-paid flow")
+            await interaction.followup.send("Could not load paid payout entries right now.", ephemeral=True)
+            return
+
+        if not summary.recent_paid_entries:
+            await interaction.followup.send("No paid rewards are available to undo right now.", ephemeral=True)
+            return
+
+        picker = RewardPayoutUndoPaidPickerView(
+            self.bot,
+            owner_user_id=str(interaction.user.id),
+            paid_entries=summary.recent_paid_entries,
+        )
+        notice = "Choose a paid reward to move back into the unpaid queue:"
+        if picker.truncated_count > 0:
+            notice = f"Choose paid reward to undo (showing first 25, {picker.truncated_count} not shown):"
+        await interaction.followup.send(content=notice, view=picker, ephemeral=True)
+
+
 class RngCABot(commands.Bot):
     def __init__(self, settings: Settings, services: BotServices) -> None:
         intents = discord.Intents.default()
@@ -1122,15 +1431,35 @@ class RngCABot(commands.Bot):
         self.services = services
         self._panel_listener_view = GlobalTaskPanelView(self)
         self._highscores_listener_view = HighscoresPanelView(self)
+        self._reward_payouts_listener_view = RewardPayoutPanelView(self)
+        self._reward_payouts_refresh_task: asyncio.Task | None = None
 
     async def setup_hook(self) -> None:
         self.add_view(self._panel_listener_view)
         self.add_view(self._highscores_listener_view)
+        self.add_view(self._reward_payouts_listener_view)
         self.tree.clear_commands(guild=None)
         try:
             await self.tree.sync()
         except Exception:
             LOGGER.exception("Failed to sync empty command tree")
+
+    def start_reward_payouts_refresh_loop(self) -> None:
+        if self.settings.reward_payouts_channel_id is None:
+            return
+        if self._reward_payouts_refresh_task is not None and not self._reward_payouts_refresh_task.done():
+            return
+        self._reward_payouts_refresh_task = asyncio.create_task(self._reward_payouts_refresh_loop())
+
+    async def _reward_payouts_refresh_loop(self) -> None:
+        try:
+            while not self.is_closed():
+                await asyncio.sleep(PAYOUTS_REFRESH_INTERVAL_SECONDS)
+                await self.ensure_reward_payouts_panel_message()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("Reward payouts refresh loop failed")
 
     def _get_panel_record(self, panel_key: str) -> dict | None:
         with self.services.sync_service.db.connection() as conn:
@@ -1240,6 +1569,21 @@ class RngCABot(commands.Bot):
             force_recreate=force_recreate,
         )
 
+    async def ensure_reward_payouts_panel_message(self, force_recreate: bool = False) -> bool:
+        summary = await asyncio.to_thread(_load_reward_payout_summary, self)
+        return await self._ensure_panel_message(
+            panel_key=PAYOUTS_PANEL_KEY,
+            channel_id=self.settings.reward_payouts_channel_id,
+            embed=_reward_payouts_embed(summary),
+            view=RewardPayoutPanelView(
+                self,
+                has_unpaid=summary.unpaid_count > 0,
+                has_paid=summary.paid_count > 0,
+            ),
+            panel_name="Reward payouts panel",
+            force_recreate=force_recreate,
+        )
+
     async def post_scan_status(self, result: ScanRunResult) -> None:
         LOGGER.info(
             f"Daily scan completed | run `{result.run_id}` | status `{result.status}` | "
@@ -1249,6 +1593,10 @@ class RngCABot(commands.Bot):
             await self.ensure_highscores_panel_message()
         except Exception:
             LOGGER.exception("Could not refresh highscores panel after scan")
+        try:
+            await self.ensure_reward_payouts_panel_message()
+        except Exception:
+            LOGGER.exception("Could not refresh reward payouts panel after scan")
 
 
 async def post_boss_image_mappings_once(
