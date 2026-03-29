@@ -101,6 +101,7 @@ class ActiveTaskAssignment:
     rsn: str
     task: RandomTaskResult
     reused_existing: bool
+    rerolls_remaining: int
 
 
 @dataclass(slots=True)
@@ -133,8 +134,12 @@ class ActiveTaskSummary:
 @dataclass(slots=True)
 class AccountCompletedTasksSummary:
     rsn: str
+    rank_label: str
     completed_tasks: int
+    completed_ca_tasks: int
+    total_ca_tasks: int
     total_points: int
+    total_points_available: int
 
 
 @dataclass(slots=True)
@@ -158,6 +163,8 @@ class BotHighscoreEntry:
     rsn: str
     verified_tasks: int
     verified_points: int
+    pending_tasks: int = 0
+    pending_points: int = 0
 
 
 @dataclass(slots=True)
@@ -175,6 +182,11 @@ class HighscoresSummary:
     entries: list["HighscoresEntry"]
     empty_text: str
     reset_text: str | None = None
+    total_verified_tasks: int = 0
+    total_verified_points: int = 0
+    total_pending_tasks: int = 0
+    total_pending_points: int = 0
+    includes_pending: bool = False
 
 
 @dataclass(slots=True)
@@ -196,6 +208,7 @@ class BossImageMapping:
 @dataclass(slots=True)
 class RewardPayoutEntry:
     reward_key: str
+    discord_user_id: str | None
     rsn: str
     reward_label: str
     reward_display_value: str
@@ -213,6 +226,53 @@ class RewardPayoutSummary:
     paid_count: int
     unpaid_entries: list[RewardPayoutEntry]
     recent_paid_entries: list[RewardPayoutEntry]
+
+
+@dataclass(slots=True)
+class RewardKeyStatusEntry:
+    reward_key: str
+    rsn: str
+    task_id: int | None
+    created_at: datetime | None
+    verified_at: datetime | None
+    used_at: datetime | None
+    payout_marked_at: datetime | None
+
+
+@dataclass(slots=True)
+class UserRewardKeySummary:
+    unused_count: int
+    pending_count: int
+    unpaid_count: int
+    unused_entries: list[RewardKeyStatusEntry]
+    pending_entries: list[RewardKeyStatusEntry]
+    unpaid_entries: list[RewardKeyStatusEntry]
+    limit_per_bucket: int
+
+
+@dataclass(slots=True)
+class AdminRerollUpdateResult:
+    discord_user_id: str
+    previous_rerolls: int
+    current_rerolls: int
+
+
+@dataclass(slots=True)
+class AdminPendingResetResult:
+    discord_user_id: str | None
+    rsn: str | None
+    reset_claims: int
+    touched_rsns: list[str]
+    ready_rewards_synced: int
+    cancelled_rewards_synced: int
+
+
+@dataclass(slots=True)
+class AdminActiveTaskClearResult:
+    discord_user_id: str
+    rsn: str | None
+    cleared_tasks: int
+    touched_rsns: list[str]
 
 
 class RuneLiteSyncError(Exception):
@@ -956,7 +1016,7 @@ class SyncService:
     def get_monthly_highscores_summary(self, limit: int | None = None) -> HighscoresSummary:
         start_at, end_at, month_label, reset_text = self._get_local_month_window()
         with self.db.connection() as conn:
-            rows = self.db.get_verified_claim_leaderboard(
+            rows = self.db.get_claim_leaderboard(
                 conn,
                 limit=limit if limit is None or limit > 0 else None,
                 start_at=start_at,
@@ -968,6 +1028,8 @@ class SyncService:
                 rsn=str(row.get("rsn") or "").strip(),
                 verified_tasks=int(row.get("verified_tasks") or 0),
                 verified_points=int(row.get("verified_points") or 0),
+                pending_tasks=int(row.get("pending_tasks") or 0),
+                pending_points=int(row.get("pending_points") or 0),
             )
             for row in rows
             if str(row.get("rsn") or "").strip()
@@ -976,22 +1038,30 @@ class SyncService:
             HighscoresEntry(
                 rank=index,
                 rsn=entry.rsn,
-                headline=f"{entry.verified_points} pts",
-                detail=f"{entry.verified_tasks} verified tasks",
+                headline=f"verified points : {entry.verified_points}",
+                detail=(
+                    f"verified tasks  : {entry.verified_tasks}\n"
+                    f"pending tasks   : {entry.pending_tasks} ({entry.pending_points} pts)"
+                ),
             )
             for index, entry in enumerate(ranked_entries, start=1)
         ]
         return HighscoresSummary(
             title=f"Monthly Highscores - {month_label}",
-            description="Verified bot-assigned progress earned this month.",
+            description="Bot-assigned progress this month. Pending entries are claims waiting on verification.",
             entries=entries,
-            empty_text="No verified bot completions yet this month.",
+            empty_text="No verified or pending bot claims yet this month.",
             reset_text=reset_text,
+            total_verified_tasks=sum(entry.verified_tasks for entry in ranked_entries),
+            total_verified_points=sum(entry.verified_points for entry in ranked_entries),
+            total_pending_tasks=sum(entry.pending_tasks for entry in ranked_entries),
+            total_pending_points=sum(entry.pending_points for entry in ranked_entries),
+            includes_pending=True,
         )
 
     def get_all_time_highscores_summary(self, limit: int | None = None) -> HighscoresSummary:
         with self.db.connection() as conn:
-            rows = self.db.get_verified_claim_leaderboard(
+            rows = self.db.get_claim_leaderboard(
                 conn,
                 limit=limit if limit is None or limit > 0 else None,
             )
@@ -1001,6 +1071,8 @@ class SyncService:
                 rsn=str(row.get("rsn") or "").strip(),
                 verified_tasks=int(row.get("verified_tasks") or 0),
                 verified_points=int(row.get("verified_points") or 0),
+                pending_tasks=int(row.get("pending_tasks") or 0),
+                pending_points=int(row.get("pending_points") or 0),
             )
             for row in rows
             if str(row.get("rsn") or "").strip()
@@ -1009,16 +1081,24 @@ class SyncService:
             HighscoresEntry(
                 rank=index,
                 rsn=entry.rsn,
-                headline=f"{entry.verified_points} pts",
-                detail=f"{entry.verified_tasks} verified tasks",
+                headline=f"verified points : {entry.verified_points}",
+                detail=(
+                    f"verified tasks  : {entry.verified_tasks}\n"
+                    f"pending tasks   : {entry.pending_tasks} ({entry.pending_points} pts)"
+                ),
             )
             for index, entry in enumerate(ranked_entries, start=1)
         ]
         return HighscoresSummary(
             title="All-Time Bot Highscores",
-            description="Verified progress earned through bot-assigned tasks.",
+            description="All-time bot-assigned progress. Pending entries are claims waiting on verification.",
             entries=entries,
-            empty_text="No verified bot completions have been recorded yet.",
+            empty_text="No verified or pending bot claims have been recorded yet.",
+            total_verified_tasks=sum(entry.verified_tasks for entry in ranked_entries),
+            total_verified_points=sum(entry.verified_points for entry in ranked_entries),
+            total_pending_tasks=sum(entry.pending_tasks for entry in ranked_entries),
+            total_pending_points=sum(entry.pending_points for entry in ranked_entries),
+            includes_pending=True,
         )
 
     def get_overall_tier_leaders_summary(self, limit: int | None = None) -> HighscoresSummary:
@@ -1047,8 +1127,11 @@ class SyncService:
             HighscoresEntry(
                 rank=index,
                 rsn=entry.rsn,
-                headline=f"{entry.tier_label} - {entry.total_points} pts",
-                detail=f"{entry.completed_tasks} completed tasks",
+                headline=f"rank tier       : {entry.tier_label}",
+                detail=(
+                    f"ca points       : {entry.total_points}\n"
+                    f"completed tasks : {entry.completed_tasks}"
+                ),
             )
             for index, entry in enumerate(tier_entries, start=1)
         ]
@@ -1057,6 +1140,7 @@ class SyncService:
             description="Current overall CA tier and total points by account.",
             entries=entries,
             empty_text="No overall progress data has been recorded yet.",
+            includes_pending=False,
         )
 
     def get_boss_image_mappings(self) -> list[BossImageMapping]:
@@ -1099,6 +1183,7 @@ class SyncService:
         payout_notes = str(row.get("payout_notes") or "").strip() or None
         return RewardPayoutEntry(
             reward_key=str(row.get("reward_key") or "").strip(),
+            discord_user_id=str(row.get("discord_user_id") or "").strip() or None,
             rsn=str(row.get("rsn") or "").strip(),
             reward_label=reward_label or reward_display_value,
             reward_display_value=reward_display_value,
@@ -1108,6 +1193,22 @@ class SyncService:
             payout_marked_at=payout_marked_at if isinstance(payout_marked_at, datetime) else None,
             payout_marked_by=payout_marked_by,
             payout_notes=payout_notes,
+        )
+
+    def _build_reward_key_status_entry(self, row: Mapping[str, object]) -> RewardKeyStatusEntry:
+        task_id_raw = row.get("task_id")
+        return RewardKeyStatusEntry(
+            reward_key=str(row.get("reward_key") or "").strip(),
+            rsn=str(row.get("rsn") or "").strip(),
+            task_id=int(task_id_raw) if task_id_raw is not None else None,
+            created_at=row.get("created_at") if isinstance(row.get("created_at"), datetime) else None,
+            verified_at=row.get("verified_at") if isinstance(row.get("verified_at"), datetime) else None,
+            used_at=row.get("used_at") if isinstance(row.get("used_at"), datetime) else None,
+            payout_marked_at=(
+                row.get("payout_marked_at")
+                if isinstance(row.get("payout_marked_at"), datetime)
+                else None
+            ),
         )
 
     def get_reward_payout_summary(
@@ -1126,6 +1227,154 @@ class SyncService:
             paid_count=int(counts.get("paid") or 0),
             unpaid_entries=[self._build_reward_payout_entry(row) for row in unpaid_rows],
             recent_paid_entries=[self._build_reward_payout_entry(row) for row in paid_rows],
+        )
+
+    def get_user_reward_key_summary(
+        self,
+        discord_user_id: str,
+        *,
+        limit_per_bucket: int = 12,
+    ) -> UserRewardKeySummary:
+        with self.db.connection() as conn:
+            raw = self.db.get_reward_key_status_summary_for_user(
+                conn,
+                discord_user_id=discord_user_id,
+                limit_per_bucket=limit_per_bucket,
+            )
+
+        return UserRewardKeySummary(
+            unused_count=int(raw.get("unused_count") or 0),
+            pending_count=int(raw.get("pending_count") or 0),
+            unpaid_count=int(raw.get("unpaid_count") or 0),
+            unused_entries=[
+                self._build_reward_key_status_entry(row)
+                for row in raw.get("unused_entries", [])
+            ],
+            pending_entries=[
+                self._build_reward_key_status_entry(row)
+                for row in raw.get("pending_entries", [])
+            ],
+            unpaid_entries=[
+                self._build_reward_key_status_entry(row)
+                for row in raw.get("unpaid_entries", [])
+            ],
+            limit_per_bucket=int(raw.get("limit_per_bucket") or max(int(limit_per_bucket), 1)),
+        )
+
+    def admin_set_rerolls(self, discord_user_id: str, rerolls_available: int) -> AdminRerollUpdateResult:
+        normalized_user_id = str(discord_user_id).strip()
+        if not normalized_user_id:
+            raise ValueError("Discord user ID is required")
+
+        target_rerolls = max(int(rerolls_available), 0)
+        with self.db.connection() as conn:
+            try:
+                profile = self.db.get_user_task_profile(conn, normalized_user_id, for_update=True)
+                previous = int(profile.get("rerolls_available") or 0)
+                self.db.update_user_task_profile(
+                    conn,
+                    normalized_user_id,
+                    rerolls_available=target_rerolls,
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return AdminRerollUpdateResult(
+            discord_user_id=normalized_user_id,
+            previous_rerolls=previous,
+            current_rerolls=target_rerolls,
+        )
+
+    def admin_adjust_rerolls(self, discord_user_id: str, delta: int) -> AdminRerollUpdateResult:
+        normalized_user_id = str(discord_user_id).strip()
+        if not normalized_user_id:
+            raise ValueError("Discord user ID is required")
+
+        delta_value = int(delta)
+        with self.db.connection() as conn:
+            try:
+                profile = self.db.get_user_task_profile(conn, normalized_user_id, for_update=True)
+                previous = int(profile.get("rerolls_available") or 0)
+                current = max(previous + delta_value, 0)
+                self.db.update_user_task_profile(
+                    conn,
+                    normalized_user_id,
+                    rerolls_available=current,
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return AdminRerollUpdateResult(
+            discord_user_id=normalized_user_id,
+            previous_rerolls=previous,
+            current_rerolls=current,
+        )
+
+    def admin_reset_pending_claims(
+        self,
+        discord_user_id: str | None = None,
+        *,
+        rsn: str | None = None,
+    ) -> AdminPendingResetResult:
+        normalized_user_id = (discord_user_id or "").strip() or None
+        normalized_rsn = (rsn or "").strip() or None
+        with self.db.connection() as conn:
+            try:
+                reset_claims, touched_rsns = self.db.reset_pending_claims(
+                    conn,
+                    discord_user_id=normalized_user_id,
+                    rsn=normalized_rsn,
+                )
+                ready_synced = 0
+                cancelled_synced = 0
+                for touched_rsn in touched_rsns:
+                    ready_count, cancelled_count = self.db.sync_reward_statuses_for_rsn(conn, touched_rsn)
+                    ready_synced += int(ready_count or 0)
+                    cancelled_synced += int(cancelled_count or 0)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        return AdminPendingResetResult(
+            discord_user_id=normalized_user_id,
+            rsn=normalized_rsn,
+            reset_claims=int(reset_claims or 0),
+            touched_rsns=touched_rsns,
+            ready_rewards_synced=ready_synced,
+            cancelled_rewards_synced=cancelled_synced,
+        )
+
+    def admin_clear_active_tasks(
+        self,
+        discord_user_id: str,
+        *,
+        rsn: str | None = None,
+    ) -> AdminActiveTaskClearResult:
+        normalized_user_id = str(discord_user_id).strip()
+        if not normalized_user_id:
+            raise ValueError("Discord user ID is required")
+
+        normalized_rsn = (rsn or "").strip() or None
+        with self.db.connection() as conn:
+            try:
+                cleared_tasks, touched_rsns = self.db.clear_active_tasks(
+                    conn,
+                    discord_user_id=normalized_user_id,
+                    rsn=normalized_rsn,
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        return AdminActiveTaskClearResult(
+            discord_user_id=normalized_user_id,
+            rsn=normalized_rsn,
+            cleared_tasks=int(cleared_tasks or 0),
+            touched_rsns=touched_rsns,
         )
 
     def mark_reward_paid(
@@ -1235,6 +1484,11 @@ class SyncService:
 
     def get_or_assign_active_task(self, discord_user_id: str, rsn_override: str | None = None) -> ActiveTaskAssignment | None:
         with self.db.connection() as conn:
+            awarded_rerolls, _, _ = self._award_due_rerolls(conn, discord_user_id)
+            if awarded_rerolls > 0:
+                conn.commit()
+            rerolls_available, _reward_batches = self._get_user_profile_snapshot(conn, discord_user_id)
+
             rsn = (rsn_override or "").strip()
             if not rsn:
                 rsn = self.db.get_rsn_for_discord_user(conn, discord_user_id) or ""
@@ -1275,6 +1529,7 @@ class SyncService:
                         rsn=active_rsn,
                         task=self._build_task_result(conn, active_task_id, len(active_incomplete_ids)),
                         reused_existing=True,
+                        rerolls_remaining=rerolls_available,
                     )
                 self.db.clear_active_task(conn, discord_user_id, rsn)
                 conn.commit()
@@ -1308,6 +1563,7 @@ class SyncService:
                 rsn=rsn,
                 task=self._build_task_result(conn, task_id, len(incomplete_ids)),
                 reused_existing=False,
+                rerolls_remaining=rerolls_available,
             )
 
     def resolve_rsn_for_discord_user(self, discord_user_id: str) -> str | None:
@@ -1358,14 +1614,35 @@ class SyncService:
                 seen_rsns.add(key)
                 account_order.append(active.rsn)
 
-            completed_tasks_by_account = [
-                AccountCompletedTasksSummary(
-                    rsn=rsn,
-                    completed_tasks=int(verified_counts_by_rsn.get(rsn, 0) or 0),
-                    total_points=self.db.get_progress_summary(conn, rsn)["total_points"],
+            catalog_points_by_tier = self.db.get_catalog_point_totals_by_tier(conn)
+            total_points_available = sum(int(points or 0) for points in catalog_points_by_tier.values())
+            tier_thresholds = self._get_catalog_tier_thresholds(conn)
+
+            completed_tasks_by_account: list[AccountCompletedTasksSummary] = []
+            for rsn in account_order:
+                progress = self.db.get_progress_summary(conn, rsn)
+                completed_ca_tasks = int(progress["completed_count"] or 0)
+                incomplete_ca_tasks = int(progress["incomplete_count"] or 0)
+                total_ca_tasks = completed_ca_tasks + incomplete_ca_tasks
+                total_points = int(progress["total_points"] or 0)
+                rank_label = "Unranked"
+                for threshold in tier_thresholds:
+                    if total_points >= int(threshold.required_points):
+                        rank_label = threshold.label
+                    else:
+                        break
+
+                completed_tasks_by_account.append(
+                    AccountCompletedTasksSummary(
+                        rsn=rsn,
+                        rank_label=rank_label,
+                        completed_tasks=int(verified_counts_by_rsn.get(rsn, 0) or 0),
+                        completed_ca_tasks=completed_ca_tasks,
+                        total_ca_tasks=total_ca_tasks,
+                        total_points=total_points,
+                        total_points_available=total_points_available,
+                    )
                 )
-                for rsn in account_order
-            ]
 
             return UserTaskProfileSummary(
                 discord_user_id=discord_user_id,

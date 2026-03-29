@@ -124,11 +124,10 @@ def main() -> None:
     started_scheduler = False
     ensured_task_panel = False
     ensured_highscores_panel = False
-    ensured_reward_payouts_panel = False
 
     @bot.event
     async def on_ready() -> None:
-        nonlocal started_scheduler, ensured_task_panel, ensured_highscores_panel, ensured_reward_payouts_panel
+        nonlocal started_scheduler, ensured_task_panel, ensured_highscores_panel
         LOGGER.info("Discord bot online as %s", bot.user)
         if not ensured_task_panel:
             try:
@@ -142,13 +141,6 @@ def main() -> None:
             except Exception:
                 LOGGER.exception("Highscores panel setup failed during startup")
             ensured_highscores_panel = True
-        if not ensured_reward_payouts_panel:
-            try:
-                await bot.ensure_reward_payouts_panel_message()
-            except Exception:
-                LOGGER.exception("Reward payouts panel setup failed during startup")
-            ensured_reward_payouts_panel = True
-        bot.start_reward_payouts_refresh_loop()
         if not started_scheduler:
             scheduler.start()
             started_scheduler = True
@@ -156,9 +148,6 @@ def main() -> None:
     @bot.event
     async def close() -> None:
         await scheduler.stop()
-        if bot._reward_payouts_refresh_task is not None:
-            bot._reward_payouts_refresh_task.cancel()
-            bot._reward_payouts_refresh_task = None
         await super(RngCABot, bot).close()
 
     bot.run(settings.discord_token, log_handler=None)

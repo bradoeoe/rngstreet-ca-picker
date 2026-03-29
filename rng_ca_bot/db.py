@@ -787,6 +787,55 @@ class Database:
 
         return verified, corrected, newly_verified_claims
 
+    def reset_pending_claims(
+        self,
+        conn: MySQLConnection,
+        *,
+        discord_user_id: str | None = None,
+        rsn: str | None = None,
+    ) -> tuple[int, list[str]]:
+        normalized_user_id = (discord_user_id or "").strip() or None
+        normalized_rsn = (rsn or "").strip() or None
+        conditions = [
+            "status = 'claimed_complete'",
+        ]
+        params: list[object] = []
+        if normalized_user_id is not None:
+            conditions.append("discord_user_id = %s")
+            params.append(normalized_user_id)
+        if normalized_rsn is not None:
+            conditions.append("rsn = %s")
+            params.append(normalized_rsn)
+
+        where_clause = " AND ".join(conditions)
+
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT DISTINCT rsn
+            FROM {TASK_CLAIMS_TABLE}
+            WHERE {where_clause}
+            ORDER BY rsn
+            """,
+            tuple(params),
+        )
+        affected_rsns = [
+            str(row[0]).strip()
+            for row in cursor.fetchall()
+            if row and str(row[0]).strip()
+        ]
+
+        cursor.execute(
+            f"""
+            UPDATE {TASK_CLAIMS_TABLE}
+            SET status = 'corrected_incomplete',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE {where_clause}
+            """,
+            tuple(params),
+        )
+        return int(cursor.rowcount or 0), affected_rsns
+
     def _generate_reward_key(self) -> str:
         parts = ["".join(secrets.choice(_REWARD_KEY_ALPHABET) for _ in range(4)) for _ in range(4)]
         return f"RNGCA-{'-'.join(parts)}"
@@ -1104,6 +1153,76 @@ class Database:
         counts["all"] = counts["unpaid"] + counts["paid"]
         return counts
 
+    def get_reward_key_status_summary_for_user(
+        self,
+        conn: MySQLConnection,
+        discord_user_id: str,
+        *,
+        limit_per_bucket: int = 12,
+    ) -> dict:
+        limit_value = max(int(limit_per_bucket), 1)
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute(
+            f"""
+            SELECT
+                SUM(CASE WHEN status = 'ready' THEN 1 ELSE 0 END) AS unused_count,
+                SUM(CASE WHEN status = 'pending_verification' THEN 1 ELSE 0 END) AS pending_count,
+                SUM(
+                    CASE WHEN status = 'redeemed' AND COALESCE(payout_status, 'unpaid') = 'unpaid'
+                         THEN 1 ELSE 0
+                    END
+                ) AS unpaid_count
+            FROM {REWARDS_TABLE}
+            WHERE discord_user_id = %s
+            """,
+            (discord_user_id,),
+        )
+        counts_row = cursor.fetchone() or {}
+
+        def _fetch_bucket(where_clause: str, order_clause: str) -> list[dict]:
+            bucket_cursor = conn.cursor(dictionary=True)
+            bucket_cursor.execute(
+                f"""
+                SELECT
+                    reward_key,
+                    rsn,
+                    task_id,
+                    status,
+                    payout_status,
+                    created_at,
+                    verified_at,
+                    used_at,
+                    payout_marked_at
+                FROM {REWARDS_TABLE}
+                WHERE discord_user_id = %s
+                  AND {where_clause}
+                ORDER BY {order_clause}
+                LIMIT %s
+                """,
+                (discord_user_id, limit_value),
+            )
+            return list(bucket_cursor.fetchall())
+
+        return {
+            "unused_count": int(counts_row.get("unused_count") or 0),
+            "pending_count": int(counts_row.get("pending_count") or 0),
+            "unpaid_count": int(counts_row.get("unpaid_count") or 0),
+            "unused_entries": _fetch_bucket(
+                "status = 'ready'",
+                "COALESCE(verified_at, created_at) DESC, id DESC",
+            ),
+            "pending_entries": _fetch_bucket(
+                "status = 'pending_verification'",
+                "created_at DESC, id DESC",
+            ),
+            "unpaid_entries": _fetch_bucket(
+                "status = 'redeemed' AND COALESCE(payout_status, 'unpaid') = 'unpaid'",
+                "COALESCE(payout_marked_at, used_at, created_at) DESC, id DESC",
+            ),
+            "limit_per_bucket": limit_value,
+        }
+
     def update_reward_payout_status(
         self,
         conn: MySQLConnection,
@@ -1244,6 +1363,72 @@ class Database:
         query += """
             GROUP BY claims.rsn
             ORDER BY verified_points DESC, verified_tasks DESC, claims.rsn ASC
+        """
+        if limit is not None:
+            query += " LIMIT %s"
+            params.append(int(limit))
+        cursor.execute(query, tuple(params))
+        return list(cursor.fetchall())
+
+    def get_claim_leaderboard(
+        self,
+        conn: MySQLConnection,
+        *,
+        limit: int | None = 10,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+    ) -> list[dict]:
+        cursor = conn.cursor(dictionary=True)
+        query = f"""
+            SELECT
+                claims.rsn,
+                SUM(CASE WHEN claims.status = 'verified_complete' THEN 1 ELSE 0 END) AS verified_tasks,
+                SUM(
+                    CASE WHEN claims.status = 'verified_complete'
+                         THEN COALESCE(catalog.points, 0)
+                         ELSE 0
+                    END
+                ) AS verified_points,
+                SUM(CASE WHEN claims.status = 'claimed_complete' THEN 1 ELSE 0 END) AS pending_tasks,
+                SUM(
+                    CASE WHEN claims.status = 'claimed_complete'
+                         THEN COALESCE(catalog.points, 0)
+                         ELSE 0
+                    END
+                ) AS pending_points,
+                MAX(CASE WHEN claims.status = 'verified_complete' THEN claims.last_verified_at ELSE NULL END) AS last_verified_at,
+                MAX(CASE WHEN claims.status = 'claimed_complete' THEN claims.updated_at ELSE NULL END) AS last_pending_at
+            FROM {TASK_CLAIMS_TABLE} AS claims
+            LEFT JOIN {TASK_CATALOG_TABLE} AS catalog
+              ON catalog.task_id = claims.task_id
+            WHERE claims.status IN ('verified_complete', 'claimed_complete')
+        """
+        params: list[object] = []
+        if start_at is not None:
+            query += """
+                AND (
+                    (claims.status = 'verified_complete' AND claims.last_verified_at >= %s)
+                    OR (claims.status = 'claimed_complete' AND claims.updated_at >= %s)
+                )
+            """
+            params.extend([start_at, start_at])
+        if end_at is not None:
+            query += """
+                AND (
+                    (claims.status = 'verified_complete' AND claims.last_verified_at < %s)
+                    OR (claims.status = 'claimed_complete' AND claims.updated_at < %s)
+                )
+            """
+            params.extend([end_at, end_at])
+        query += """
+            GROUP BY claims.rsn
+            HAVING verified_tasks > 0 OR pending_tasks > 0
+            ORDER BY
+                verified_points DESC,
+                verified_tasks DESC,
+                pending_points DESC,
+                pending_tasks DESC,
+                claims.rsn ASC
         """
         if limit is not None:
             query += " LIMIT %s"
@@ -1506,6 +1691,50 @@ class Database:
             """,
             (discord_user_id, rsn),
         )
+
+    def clear_active_tasks(
+        self,
+        conn: MySQLConnection,
+        *,
+        discord_user_id: str,
+        rsn: str | None = None,
+    ) -> tuple[int, list[str]]:
+        normalized_user_id = str(discord_user_id).strip()
+        if not normalized_user_id:
+            return 0, []
+
+        normalized_rsn = (rsn or "").strip() or None
+        conditions = ["discord_user_id = %s"]
+        params: list[object] = [normalized_user_id]
+        if normalized_rsn is not None:
+            conditions.append("rsn = %s")
+            params.append(normalized_rsn)
+
+        where_clause = " AND ".join(conditions)
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT rsn
+            FROM {ACTIVE_TASKS_TABLE}
+            WHERE {where_clause}
+            ORDER BY rsn
+            """,
+            tuple(params),
+        )
+        affected_rsns = [
+            str(row[0]).strip()
+            for row in cursor.fetchall()
+            if row and str(row[0]).strip()
+        ]
+
+        cursor.execute(
+            f"""
+            DELETE FROM {ACTIVE_TASKS_TABLE}
+            WHERE {where_clause}
+            """,
+            tuple(params),
+        )
+        return int(cursor.rowcount or 0), affected_rsns
 
 
 def completed_scan_status(success_users: int, failed_users: int) -> str:

@@ -2,25 +2,30 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Sequence
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from .config import Settings
 from .db import ScanRunResult
 from .sync_service import (
     ActiveTaskAssignment,
+    ActiveTaskSummary,
     BossImageMapping,
     CompletionResult,
     HighscoresSummary,
+    RewardKeyStatusEntry,
     RewardPayoutEntry,
     RewardPayoutSummary,
     RandomTaskResult,
     RerollResult,
     SyncService,
+    UserRewardKeySummary,
     UserTaskProfileSummary,
 )
 
@@ -28,14 +33,20 @@ LOGGER = logging.getLogger(__name__)
 
 PANEL_KEY = "global_task_panel"
 HIGHSCORES_PANEL_KEY = "global_highscores_panel"
-PAYOUTS_PANEL_KEY = "reward_payouts_panel"
 GET_TASK_CUSTOM_ID = "rngca:panel:get_task"
 REROLL_CUSTOM_ID = "rngca:panel:reroll"
 COMPLETE_TASK_CUSTOM_ID = "rngca:panel:complete_task"
 PROFILE_CUSTOM_ID = "rngca:panel:profile"
+PROFILE_REWARDS_CUSTOM_ID = "rngca:profile:rewards"
 MONTHLY_HIGHSCORES_CUSTOM_ID = "rngca:highscores:monthly"
 ALL_TIME_HIGHSCORES_CUSTOM_ID = "rngca:highscores:all_time"
 OVERALL_TIER_LEADERS_CUSTOM_ID = "rngca:highscores:tier_leaders"
+ADMIN_SET_REROLLS_CUSTOM_ID = "rngca:admin:set_rerolls"
+ADMIN_ADD_REROLLS_CUSTOM_ID = "rngca:admin:add_rerolls"
+ADMIN_RESET_PENDING_CUSTOM_ID = "rngca:admin:reset_pending"
+ADMIN_CLEAR_ACTIVE_CUSTOM_ID = "rngca:admin:clear_active"
+ADMIN_PAYOUTS_CUSTOM_ID = "rngca:admin:payouts"
+ADMIN_REFRESH_PANELS_CUSTOM_ID = "rngca:admin:refresh_panels"
 PAYOUTS_REFRESH_CUSTOM_ID = "rngca:payouts:refresh"
 PAYOUTS_MARK_PAID_CUSTOM_ID = "rngca:payouts:mark_paid"
 PAYOUTS_UNDO_PAID_CUSTOM_ID = "rngca:payouts:undo_paid"
@@ -48,7 +59,19 @@ HIGHSCORES_MODE_MONTHLY = "monthly"
 HIGHSCORES_MODE_ALL_TIME = "all_time"
 HIGHSCORES_MODE_TIER_LEADERS = "tier_leaders"
 HIGHSCORES_PAGE_SIZE = 20
-PAYOUTS_REFRESH_INTERVAL_SECONDS = 60
+DISCORD_USER_MENTION_PATTERN = re.compile(r"^<@!?(\d+)>$")
+PROFILE_ICON_IMAGE_URL = (
+    "https://oldschool.runescape.wiki/w/Special:Redirect/file/"
+    "Vampyric_slayer_helmet_detail.png"
+)
+PROFILE_BANNER_IMAGE_URL = "https://cdn.displate.com/artwork/1200x857/2025-11-25/c22bef74-5c80-4c40-a08b-f6721a207f6a.jpg"
+HIGHSCORES_ICON_IMAGE_URL = "https://oldschool.runescape.wiki/images/Ghommal%27s_lucky_penny_detail.png?75281"
+HIGHSCORES_BANNER_IMAGE_URL = (
+    "https://www.reddit.com/media?url=https%3A%2F%2Fpreview.redd.it%2F"
+    "the-post-2021-decline-of-osrs-promo-art-quality-v0-vmv9v79akhme1.jpg%3F"
+    "width%3D1080%26crop%3Dsmart%26auto%3Dwebp%26s%3D16120ca71ff408a8b50a478b3a8a56e8e074e704"
+)
+REWARDS_BANNER_IMAGE_URL = "https://i.servimg.com/u/f64/19/92/56/41/rs_art10.png"
 
 
 @dataclass(slots=True)
@@ -93,6 +116,47 @@ def _audit_log(interaction: discord.Interaction, event: str, **fields: object) -
         interaction.channel_id,
         extras,
     )
+
+
+def _parse_discord_user_id(value: str) -> str | None:
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if cleaned.isdigit():
+        return cleaned
+    match = DISCORD_USER_MENTION_PATTERN.fullmatch(cleaned)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _normalize_optional_rsn(value: str) -> str | None:
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def _has_kick_members_permission(interaction: discord.Interaction) -> bool:
+    if interaction.guild is None:
+        return False
+    if isinstance(interaction.user, discord.Member):
+        return bool(interaction.user.guild_permissions.kick_members)
+    member = interaction.guild.get_member(interaction.user.id)
+    return bool(member and member.guild_permissions.kick_members)
+
+
+async def _ensure_kick_members_permission(interaction: discord.Interaction) -> bool:
+    if interaction.guild is None:
+        message = "This admin action can only be used inside a server."
+    elif _has_kick_members_permission(interaction):
+        return True
+    else:
+        message = "You need **Kick Members** permission to use this admin action."
+
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+    return False
 
 
 def _task_color(points: int | None, tier_label: str | None) -> discord.Color:
@@ -143,6 +207,7 @@ def _task_embed(
     rsn: str,
     task: RandomTaskResult,
     *,
+    rerolls_remaining: int | None = None,
     reward_key: str | None = None,
     reward_status: str | None = None,
 ) -> discord.Embed:
@@ -166,6 +231,8 @@ def _task_embed(
         value=f"**{max(task.eligible_count, 0)}**",
         inline=False,
     )
+    if rerolls_remaining is not None:
+        embed.add_field(name="Rerolls Remaining", value=f"**{max(int(rerolls_remaining), 0)}**", inline=True)
     if reward_key:
         embed.add_field(name="Reward Key", value=f"`{reward_key}`", inline=False)
     if reward_status:
@@ -213,11 +280,11 @@ def _panel_embed() -> discord.Embed:
 
 def _highscores_rank_badge(rank: int) -> str:
     if rank == 1:
-        return "🥇"
+        return "1st"
     if rank == 2:
-        return "🥈"
+        return "2nd"
     if rank == 3:
-        return "🥉"
+        return "3rd"
     return f"{rank}."
 
 
@@ -251,40 +318,65 @@ def _highscores_embed(
         color=_highscores_color(mode),
         timestamp=datetime.now(UTC),
     )
-    if summary.reset_text:
-        embed.add_field(name="Reset", value=summary.reset_text, inline=True)
-    embed.add_field(name="Page", value=f"{page_index + 1}/{total_pages}", inline=True)
-    embed.add_field(name="Tracked", value=f"**{total_entries}**", inline=True)
 
     if page_entries:
         for entry in page_entries:
             is_highlighted = bool(highlight_rsn and entry.rsn.casefold() == highlight_rsn.casefold())
+            entry_lines = _truncate_text(f"{entry.headline}\n{entry.detail}", 1016)
             embed.add_field(
-                name=f"{_highscores_rank_badge(entry.rank)} `{entry.rsn}`{' • YOU' if is_highlighted else ''}",
-                value=f"**{entry.headline}**\n{entry.detail}",
+                name=f"{_highscores_rank_badge(entry.rank)} {entry.rsn}{' | YOU' if is_highlighted else ''}",
+                value=f"```{entry_lines}```",
                 inline=False,
             )
     else:
         embed.add_field(name="Highscores", value=summary.empty_text, inline=False)
 
     footer = "Private highscores browser" if private_view else "Buttons below open private highscores views"
+    footer = f"{footer} | Page {page_index + 1}/{total_pages}"
+    if summary.reset_text:
+        footer = f"{footer} | Reset {summary.reset_text}"
     embed.set_footer(text=footer)
+    embed.set_thumbnail(url=HIGHSCORES_ICON_IMAGE_URL)
+    embed.set_image(url=HIGHSCORES_BANNER_IMAGE_URL)
     return embed
 
 
-def _reward_payout_status_line(entry: RewardPayoutEntry, *, paid: bool) -> str:
-    if paid:
-        paid_by = entry.payout_marked_by or "Unknown admin"
-        paid_at = _discord_relative_timestamp(entry.payout_marked_at)
-        return (
-            f"`{entry.rsn}` • **{entry.reward_display_value}**\n"
-            f"Paid by **{paid_by}** {paid_at}"
-        )
+def _payout_board_user_key(entry: RewardPayoutEntry) -> str:
+    user_id = (entry.discord_user_id or "").strip()
+    if user_id:
+        return user_id
+    rsn = (entry.rsn or "").strip()
+    if rsn:
+        return f"rsn:{rsn.casefold()}"
+    return "unknown"
 
-    return (
-        f"`{entry.rsn}` • **{entry.reward_display_value}** • `{_compact_reward_key(entry.reward_key)}`\n"
-        f"Redeemed {_discord_relative_timestamp(entry.redeemed_at)}"
-    )
+
+def _payout_board_user_label(user_key: str, entries: Sequence[RewardPayoutEntry]) -> str:
+    if user_key.startswith("rsn:"):
+        rsn = entries[0].rsn if entries else "Unknown RSN"
+        return f"RSN {rsn}"
+    if user_key.isdigit():
+        return f"Discord {user_key}"
+    if user_key == "unknown":
+        return "Unknown User"
+    return user_key
+
+
+def _payout_board_user_lines(entries: Sequence[RewardPayoutEntry], *, max_lines: int = 6) -> str:
+    if not entries:
+        return "None"
+    lines: list[str] = []
+    visible_entries = list(entries)[:max_lines]
+    for index, entry in enumerate(visible_entries, start=1):
+        reward_text = _truncate_text(entry.reward_display_value, 46)
+        tier_text = _truncate_text(entry.reward_tier or "Unknown", 16)
+        rsn_text = _truncate_text(entry.rsn or "Unknown", 16)
+        key_text = _compact_reward_key(entry.reward_key)
+        lines.append(f"{index}. {rsn_text} | {reward_text} | {tier_text} | {key_text}")
+    hidden = len(entries) - len(visible_entries)
+    if hidden > 0:
+        lines.append(f"... +{hidden} more")
+    return _truncate_text("\n".join(lines), 1016)
 
 
 def _reward_payouts_embed(summary: RewardPayoutSummary) -> discord.Embed:
@@ -292,35 +384,47 @@ def _reward_payouts_embed(summary: RewardPayoutSummary) -> discord.Embed:
     color = discord.Color.orange() if has_unpaid else discord.Color.green()
     embed = discord.Embed(
         title="Reward Payout Board",
-        description="Redeemed reward keys waiting on manual payout. Keep this in an admin-only channel.",
+        description="Users with redeemed keys waiting for manual payout.",
         color=color,
         timestamp=datetime.now(UTC),
     )
-    embed.add_field(name="Needs Payout", value=f"**{summary.unpaid_count}**", inline=True)
-    embed.add_field(name="Paid Out", value=f"**{summary.paid_count}**", inline=True)
-    embed.add_field(name="Updated", value=_discord_relative_timestamp(datetime.now(UTC)), inline=True)
 
-    if summary.unpaid_entries:
-        unpaid_lines = [_reward_payout_status_line(entry, paid=False) for entry in summary.unpaid_entries]
-        embed.add_field(
-            name="Waiting Now",
-            value=_truncate_text("\n\n".join(unpaid_lines), 1024),
-            inline=False,
+    grouped_by_user: dict[str, list[RewardPayoutEntry]] = {}
+    for entry in summary.unpaid_entries:
+        grouped_by_user.setdefault(_payout_board_user_key(entry), []).append(entry)
+
+    summary_lines = [
+        f"pending payout keys : {summary.unpaid_count}",
+        f"users waiting       : {len(grouped_by_user)}",
+        f"paid payout keys    : {summary.paid_count}",
+    ]
+    embed.add_field(name="Summary", value="```" + "\n".join(summary_lines) + "```", inline=False)
+
+    if grouped_by_user:
+        ordered_users = sorted(
+            grouped_by_user.items(),
+            key=lambda item: (-len(item[1]), item[0].casefold()),
         )
+        max_user_fields = 9
+        visible_users = ordered_users[:max_user_fields]
+        for user_key, owed_entries in visible_users:
+            user_label = _truncate_text(_payout_board_user_label(user_key, owed_entries), 240)
+            embed.add_field(
+                name=f"{user_label} ({len(owed_entries)})",
+                value=f"```{_payout_board_user_lines(owed_entries)}```",
+                inline=False,
+            )
+        hidden_users = len(ordered_users) - len(visible_users)
+        if hidden_users > 0:
+            embed.add_field(
+                name="More Users",
+                value=f"{hidden_users} additional user(s) have unpaid rewards not shown.",
+                inline=False,
+            )
     else:
-        embed.add_field(name="Waiting Now", value="Nothing is waiting on payout right now.", inline=False)
+        embed.add_field(name="Payout Queue", value="Nobody is waiting on payout right now.", inline=False)
 
-    if summary.recent_paid_entries:
-        paid_lines = [_reward_payout_status_line(entry, paid=True) for entry in summary.recent_paid_entries]
-        embed.add_field(
-            name="Recently Paid",
-            value=_truncate_text("\n\n".join(paid_lines), 1024),
-            inline=False,
-        )
-    else:
-        embed.add_field(name="Recently Paid", value="No paid rewards have been recorded yet.", inline=False)
-
-    footer = "Use Refresh or Mark Paid below. The board refreshes automatically every minute."
+    footer = "Use Refresh or Mark Paid below."
     embed.set_footer(text=footer)
     return embed
 
@@ -338,41 +442,116 @@ def _action_human_name(action: str) -> str:
 
 
 def _profile_embed(profile: UserTaskProfileSummary) -> discord.Embed:
+    total_accounts = len(profile.completed_tasks_by_account)
+    total_completed_tasks = sum(account.completed_tasks for account in profile.completed_tasks_by_account)
+    active_by_rsn: dict[str, ActiveTaskSummary] = {}
+    for active in profile.active_tasks:
+        key = active.rsn.casefold()
+        if key not in active_by_rsn:
+            active_by_rsn[key] = active
+
+    summary_lines = [
+        f"Rerolls remaining : {profile.rerolls_available}",
+        f"accounts tracked : {total_accounts}",
+        f"Bot tasks complete: {total_completed_tasks}",
+        f"active tasks : {len(profile.active_tasks)}",
+    ]
+
     embed = discord.Embed(
-        title="Task Profile",
-        description="Your CA challenge progress across bot-assigned tasks.",
-        color=discord.Color.blurple(),
+        title="Boss Progress",
+        description="Track your Combat Achievement progress at a glance.",
+        color=discord.Color.from_rgb(232, 113, 38),
         timestamp=datetime.now(UTC),
     )
-    embed.add_field(name="Rerolls", value=f"**{profile.rerolls_available}**", inline=True)
-
-    if profile.completed_tasks_by_account:
-        completed_lines = [
-            f"`{account.rsn}`: **{account.completed_tasks}** bot tasks | **{account.total_points} pts**"
-            for account in profile.completed_tasks_by_account
-        ]
-        embed.add_field(
-            name="Account Progress",
-            value=_truncate_text("\n".join(completed_lines), 1024),
-            inline=False,
-        )
-    else:
-        embed.add_field(name="Account Progress", value="No account progress found yet.", inline=False)
+    embed.add_field(name="Summary", value="```" + "\n".join(summary_lines) + "```", inline=False)
 
     if profile.active_tasks:
         active_lines = [
-            f"`{active.rsn}`: {active.task.task_name} (`ID {active.task.task_id}`)"
+            f"`{active.rsn}`: {active.task.task_name}"
             for active in profile.active_tasks
         ]
         embed.add_field(
-            name="Active Accounts",
+            name="Active Tasks",
             value=_truncate_text("\n".join(active_lines), 1024),
             inline=False,
         )
     else:
-        embed.add_field(name="Active Accounts", value="None right now.", inline=False)
+        embed.add_field(name="Active Tasks", value="None right now.", inline=False)
 
-    embed.set_footer(text="Combat Task Tracker")
+    if profile.completed_tasks_by_account:
+        max_account_fields = 20
+        visible_accounts = profile.completed_tasks_by_account[:max_account_fields]
+        for account in visible_accounts:
+            active_summary = active_by_rsn.get(account.rsn.casefold())
+            current_task_label = active_summary.task.task_name if active_summary is not None else "None"
+            code_lines = [
+                f"rank : {account.rank_label}",
+                f"tasks : {account.completed_ca_tasks} / {account.total_ca_tasks}",
+                f"Current task : {current_task_label}",
+            ]
+            embed.add_field(
+                name=account.rsn,
+                value="```" + "\n".join(code_lines) + "```",
+                inline=False,
+            )
+        hidden_count = len(profile.completed_tasks_by_account) - len(visible_accounts)
+        if hidden_count > 0:
+            embed.add_field(
+                name="More Accounts",
+                value=f"{hidden_count} additional account(s) not shown.",
+                inline=False,
+            )
+    else:
+        embed.add_field(name="Accounts", value="No account progress found yet.", inline=False)
+
+    embed.set_thumbnail(url=PROFILE_ICON_IMAGE_URL)
+    embed.set_image(url=PROFILE_BANNER_IMAGE_URL)
+    embed.set_footer(text="Combat Task Tracker | Profile")
+    return embed
+
+
+def _reward_key_bucket_lines(entries: Sequence[RewardKeyStatusEntry]) -> str:
+    if not entries:
+        return "None"
+    lines: list[str] = []
+    for entry in entries:
+        rsn_label = entry.rsn or "Unknown RSN"
+        task_label = f"Task {entry.task_id}" if entry.task_id is not None else "Task -"
+        lines.append(f"`{entry.reward_key}` | {rsn_label} | {task_label}")
+    return _truncate_text("\n".join(lines), 1024)
+
+
+def _profile_rewards_embed(summary: UserRewardKeySummary) -> discord.Embed:
+    summary_lines = [
+        f"Pending reward keys : {summary.pending_count}",
+        f"Unused reward keys  : {summary.unused_count}",
+        f"Unpaid reward keys  : {summary.unpaid_count}",
+    ]
+    embed = discord.Embed(
+        title="Reward Keys",
+        description="Your reward-key status across all linked accounts.",
+        color=discord.Color.gold(),
+        timestamp=datetime.now(UTC),
+    )
+    embed.add_field(name="Summary", value="```" + "\n".join(summary_lines) + "```", inline=False)
+    embed.add_field(
+        name="Pending Reward Keys",
+        value=_reward_key_bucket_lines(summary.pending_entries),
+        inline=False,
+    )
+    embed.add_field(
+        name="Unused Reward Keys",
+        value=_reward_key_bucket_lines(summary.unused_entries),
+        inline=False,
+    )
+    embed.add_field(
+        name="Unpaid Reward Keys",
+        value=_reward_key_bucket_lines(summary.unpaid_entries),
+        inline=False,
+    )
+    embed.set_thumbnail(url=PROFILE_ICON_IMAGE_URL)
+    embed.set_image(url=REWARDS_BANNER_IMAGE_URL)
+    embed.set_footer(text=f"Showing up to {summary.limit_per_bucket} keys per category")
     return embed
 
 
@@ -399,25 +578,18 @@ async def _refresh_highscores_panel(bot: "RngCABot") -> None:
     except Exception:
         LOGGER.exception("Could not refresh highscores panel after completion")
 
-
-async def _refresh_reward_payouts_panel(bot: "RngCABot") -> None:
-    try:
-        await bot.ensure_reward_payouts_panel_message()
-    except Exception:
-        LOGGER.exception("Could not refresh reward payouts panel")
-
-
 def _active_task_message_payload(
     bot: "RngCABot",
     *,
     owner_user_id: str,
     rsn: str,
     task: RandomTaskResult,
+    rerolls_remaining: int | None = None,
     content: str | None = None,
 ) -> dict[str, object]:
     return {
         "content": content,
-        "embed": _task_embed(rsn, task),
+        "embed": _task_embed(rsn, task, rerolls_remaining=rerolls_remaining),
         "view": AssignedTaskView(bot, owner_user_id=owner_user_id, rsn=rsn),
     }
 
@@ -434,6 +606,7 @@ async def _send_assignment_response(
             owner_user_id=owner_user_id,
             rsn=assignment.rsn,
             task=assignment.task,
+            rerolls_remaining=assignment.rerolls_remaining,
         ),
     )
 
@@ -529,6 +702,7 @@ async def _run_panel_action(
             embed=_task_embed(
                 completed.rsn,
                 completed.task,
+                rerolls_remaining=completed.rerolls_remaining,
                 reward_key=completed.reward_key,
                 reward_status=completed.reward_status,
             ),
@@ -599,6 +773,7 @@ async def _run_panel_action(
                 owner_user_id=discord_user_id,
                 rsn=rsn,
                 task=result.replacement_task,
+                rerolls_remaining=result.rerolls_remaining,
                 content=(
                     f"Rerolled `{rsn}` from **{result.previous_task.task_name}** "
                     f"to a new task. Rerolls left: **{result.rerolls_remaining}**."
@@ -628,7 +803,14 @@ async def _run_panel_action(
             accounts=len(profile.completed_tasks_by_account),
             active_tasks=len(profile.active_tasks),
         )
-        await _send_ephemeral_followup(interaction, embed=_profile_embed(profile))
+        await _send_ephemeral_followup(
+            interaction,
+            embed=_profile_embed(profile),
+            view=ProfileActionsView(
+                bot,
+                owner_user_id=discord_user_id,
+            ),
+        )
         return
 
     await _send_ephemeral_followup(interaction, content="Unknown task action.")
@@ -644,6 +826,74 @@ def _load_highscores_summary(bot: "RngCABot", mode: str) -> HighscoresSummary:
 
 def _load_reward_payout_summary(bot: "RngCABot") -> RewardPayoutSummary:
     return bot.services.sync_service.get_reward_payout_summary()
+
+
+def _admin_panel_embed(default_target_user_id: str | None = None) -> discord.Embed:
+    target_hint = default_target_user_id or "(enter per action)"
+    embed = discord.Embed(
+        title="Admin Controls (v1)",
+        description="Moderator tools for rerolls and task-state cleanup.",
+        color=discord.Color.orange(),
+        timestamp=datetime.now(UTC),
+    )
+    embed.add_field(
+        name="Actions",
+        value=(
+            "`Set Rerolls` - set exact reroll count for one user\n"
+            "`Add Rerolls` - add or subtract rerolls\n"
+            "`Reset Pending` - reset ALL claimed-unverified tasks\n"
+            "`Clear Active Task` - remove current assigned task(s)\n"
+            "`Payout Board` - open pending payouts in admin\n"
+            "`Refresh Panels` - refresh task + highscores boards"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Target User",
+        value=f"`{target_hint}`",
+        inline=False,
+    )
+    embed.set_footer(text="Requires Kick Members permission")
+    return embed
+
+
+async def _open_admin_payout_board(
+    bot: "RngCABot",
+    interaction: discord.Interaction,
+    *,
+    owner_user_id: str,
+    edit_existing: bool = False,
+) -> None:
+    try:
+        summary = await asyncio.to_thread(_load_reward_payout_summary, bot)
+    except Exception:
+        LOGGER.exception("Could not load reward payout summary for admin board")
+        message = "Could not load payout entries right now."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+        return
+
+    view = AdminRewardPayoutsView(
+        bot,
+        owner_user_id=owner_user_id,
+        has_unpaid=summary.unpaid_count > 0,
+        has_paid=summary.paid_count > 0,
+    )
+    embed = _reward_payouts_embed(summary)
+
+    if edit_existing:
+        if interaction.response.is_done():
+            await interaction.edit_original_response(content=None, embed=embed, view=view)
+        else:
+            await interaction.response.edit_message(content=None, embed=embed, view=view)
+        return
+
+    if interaction.response.is_done():
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 def _find_highscores_entry(summary: HighscoresSummary, rsn: str):
@@ -731,6 +981,49 @@ async def _send_highscores_position(
         edit_existing=True,
         highlight_rsn=entry.rsn,
     )
+
+
+class ProfileActionsView(discord.ui.View):
+    def __init__(self, bot: "RngCABot", *, owner_user_id: str) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.owner_user_id = owner_user_id
+
+    async def _ensure_owner(self, interaction: discord.Interaction) -> bool:
+        if str(interaction.user.id) == self.owner_user_id:
+            return True
+        await interaction.response.send_message("This profile view belongs to another user.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Rewards", style=discord.ButtonStyle.secondary, custom_id=PROFILE_REWARDS_CUSTOM_ID)
+    async def rewards(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if not await self._ensure_owner(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            summary = await asyncio.to_thread(
+                self.bot.services.sync_service.get_user_reward_key_summary,
+                self.owner_user_id,
+            )
+        except Exception:
+            LOGGER.exception("Reward summary lookup failed for user %s", self.owner_user_id)
+            await interaction.followup.send(
+                "Could not load your reward-key summary right now. Please try again.",
+                ephemeral=True,
+            )
+            return
+
+        _audit_log(
+            interaction,
+            "profile_rewards_view",
+            pending_count=summary.pending_count,
+            unused_count=summary.unused_count,
+            unpaid_count=summary.unpaid_count,
+        )
+        await interaction.followup.send(
+            embed=_profile_rewards_embed(summary),
+            ephemeral=True,
+        )
 
 
 class AccountPickerView(discord.ui.View):
@@ -851,6 +1144,7 @@ class AssignedTaskView(discord.ui.View):
                 owner_user_id=self.owner_user_id,
                 rsn=self.rsn,
                 task=result.replacement_task,
+                rerolls_remaining=result.rerolls_remaining,
             ),
         )
 
@@ -908,6 +1202,7 @@ class AssignedTaskView(discord.ui.View):
             embed=_task_embed(
                 completed.rsn,
                 completed.task,
+                rerolls_remaining=completed.rerolls_remaining,
                 reward_key=completed.reward_key,
                 reward_status=completed.reward_status,
             ),
@@ -1204,6 +1499,387 @@ class HighscoresBrowserView(discord.ui.View):
         await self._go_to(interaction, page=min(self.page + 1, self.total_pages - 1))
 
 
+class _AdminActionModal(discord.ui.Modal):
+    def __init__(
+        self,
+        bot: "RngCABot",
+        *,
+        title: str,
+        default_target_user_id: str | None = None,
+    ) -> None:
+        super().__init__(title=title)
+        self.bot = bot
+        self.target_user_input = discord.ui.TextInput(
+            label="Target user",
+            placeholder="Discord user ID or @mention",
+            required=True,
+            max_length=40,
+            default=default_target_user_id or "",
+        )
+        self.add_item(self.target_user_input)
+
+    def _target_user_id(self) -> str | None:
+        return _parse_discord_user_id(str(self.target_user_input.value))
+
+
+class AdminSetRerollsModal(_AdminActionModal):
+    def __init__(self, bot: "RngCABot", *, default_target_user_id: str | None = None) -> None:
+        super().__init__(
+            bot,
+            title="Set Rerolls",
+            default_target_user_id=default_target_user_id,
+        )
+        self.total_input = discord.ui.TextInput(
+            label="New reroll total",
+            placeholder="0",
+            required=True,
+            max_length=10,
+        )
+        self.add_item(self.total_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_kick_members_permission(interaction):
+            return
+        target_user_id = self._target_user_id()
+        if target_user_id is None:
+            await interaction.response.send_message(
+                "Provide a valid Discord user ID or mention for the target user.",
+                ephemeral=True,
+            )
+            return
+        try:
+            new_total = int(str(self.total_input.value).strip())
+        except ValueError:
+            await interaction.response.send_message("Reroll total must be a whole number.", ephemeral=True)
+            return
+        if new_total < 0:
+            await interaction.response.send_message("Rerolls cannot be negative.", ephemeral=True)
+            return
+        try:
+            result = await asyncio.to_thread(
+                self.bot.services.sync_service.admin_set_rerolls,
+                target_user_id,
+                new_total,
+            )
+        except Exception:
+            LOGGER.exception("Admin set rerolls failed for target user %s", target_user_id)
+            await interaction.response.send_message(
+                "Could not update rerolls right now. Please try again.",
+                ephemeral=True,
+            )
+            return
+        _audit_log(
+            interaction,
+            "admin_set_rerolls",
+            target_user_id=target_user_id,
+            previous_rerolls=result.previous_rerolls,
+            current_rerolls=result.current_rerolls,
+        )
+        await interaction.response.send_message(
+            (
+                f"Updated rerolls for <@{target_user_id}>: "
+                f"**{result.previous_rerolls} -> {result.current_rerolls}**."
+            ),
+            ephemeral=True,
+        )
+
+
+class AdminAddRerollsModal(_AdminActionModal):
+    def __init__(self, bot: "RngCABot", *, default_target_user_id: str | None = None) -> None:
+        super().__init__(
+            bot,
+            title="Add Rerolls",
+            default_target_user_id=default_target_user_id,
+        )
+        self.delta_input = discord.ui.TextInput(
+            label="Reroll delta",
+            placeholder="+1 or -1",
+            required=True,
+            max_length=10,
+        )
+        self.add_item(self.delta_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_kick_members_permission(interaction):
+            return
+        target_user_id = self._target_user_id()
+        if target_user_id is None:
+            await interaction.response.send_message(
+                "Provide a valid Discord user ID or mention for the target user.",
+                ephemeral=True,
+            )
+            return
+        try:
+            delta = int(str(self.delta_input.value).strip())
+        except ValueError:
+            await interaction.response.send_message("Reroll delta must be a whole number.", ephemeral=True)
+            return
+        if delta == 0:
+            await interaction.response.send_message("Reroll delta cannot be zero.", ephemeral=True)
+            return
+        try:
+            result = await asyncio.to_thread(
+                self.bot.services.sync_service.admin_adjust_rerolls,
+                target_user_id,
+                delta,
+            )
+        except Exception:
+            LOGGER.exception("Admin add rerolls failed for target user %s", target_user_id)
+            await interaction.response.send_message(
+                "Could not update rerolls right now. Please try again.",
+                ephemeral=True,
+            )
+            return
+        _audit_log(
+            interaction,
+            "admin_adjust_rerolls",
+            target_user_id=target_user_id,
+            delta=delta,
+            previous_rerolls=result.previous_rerolls,
+            current_rerolls=result.current_rerolls,
+        )
+        await interaction.response.send_message(
+            (
+                f"Applied reroll delta **{delta:+d}** for <@{target_user_id}>. "
+                f"Now **{result.current_rerolls}** (was {result.previous_rerolls})."
+            ),
+            ephemeral=True,
+        )
+
+
+class AdminClearActiveTaskModal(_AdminActionModal):
+    def __init__(self, bot: "RngCABot", *, default_target_user_id: str | None = None) -> None:
+        super().__init__(
+            bot,
+            title="Clear Active Task",
+            default_target_user_id=default_target_user_id,
+        )
+        self.rsn_input = discord.ui.TextInput(
+            label="RSN (optional)",
+            placeholder="Leave blank to clear all active tasks for the user",
+            required=False,
+            max_length=32,
+        )
+        self.add_item(self.rsn_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_kick_members_permission(interaction):
+            return
+        target_user_id = self._target_user_id()
+        if target_user_id is None:
+            await interaction.response.send_message(
+                "Provide a valid Discord user ID or mention for the target user.",
+                ephemeral=True,
+            )
+            return
+        rsn_value = _normalize_optional_rsn(str(self.rsn_input.value))
+        try:
+            result = await asyncio.to_thread(
+                self.bot.services.sync_service.admin_clear_active_tasks,
+                target_user_id,
+                rsn=rsn_value,
+            )
+        except Exception:
+            LOGGER.exception(
+                "Admin clear active task failed for target user %s rsn %s",
+                target_user_id,
+                rsn_value,
+            )
+            await interaction.response.send_message(
+                "Could not clear active task(s) right now. Please try again.",
+                ephemeral=True,
+            )
+            return
+        touched_label = ", ".join(result.touched_rsns) if result.touched_rsns else "none"
+        _audit_log(
+            interaction,
+            "admin_clear_active_tasks",
+            target_user_id=target_user_id,
+            rsn=rsn_value,
+            cleared_tasks=result.cleared_tasks,
+            touched_rsns=len(result.touched_rsns),
+        )
+        await interaction.response.send_message(
+            (
+                f"Cleared **{result.cleared_tasks}** active task row(s) for <@{target_user_id}>.\n"
+                f"RSNs touched: `{touched_label}`"
+            ),
+            ephemeral=True,
+        )
+
+
+class AdminPanelView(discord.ui.View):
+    def __init__(
+        self,
+        bot: "RngCABot",
+        *,
+        owner_user_id: str,
+        default_target_user_id: str | None = None,
+    ) -> None:
+        super().__init__(timeout=900)
+        self.bot = bot
+        self.owner_user_id = owner_user_id
+        self.default_target_user_id = default_target_user_id
+
+    async def _ensure_owner(self, interaction: discord.Interaction) -> bool:
+        if str(interaction.user.id) == self.owner_user_id:
+            return True
+        await interaction.response.send_message("This admin panel belongs to another user.", ephemeral=True)
+        return False
+
+    async def _open_modal(self, interaction: discord.Interaction, modal: discord.ui.Modal) -> None:
+        if not await self._ensure_owner(interaction):
+            return
+        if not await _ensure_kick_members_permission(interaction):
+            return
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(
+        label="Set Rerolls",
+        style=discord.ButtonStyle.secondary,
+        custom_id=ADMIN_SET_REROLLS_CUSTOM_ID,
+        row=0,
+    )
+    async def set_rerolls(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        await self._open_modal(
+            interaction,
+            AdminSetRerollsModal(
+                self.bot,
+                default_target_user_id=self.default_target_user_id,
+            ),
+        )
+
+    @discord.ui.button(
+        label="Add Rerolls",
+        style=discord.ButtonStyle.secondary,
+        custom_id=ADMIN_ADD_REROLLS_CUSTOM_ID,
+        row=0,
+    )
+    async def add_rerolls(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        await self._open_modal(
+            interaction,
+            AdminAddRerollsModal(
+                self.bot,
+                default_target_user_id=self.default_target_user_id,
+            ),
+        )
+
+    @discord.ui.button(
+        label="Reset Pending",
+        style=discord.ButtonStyle.danger,
+        custom_id=ADMIN_RESET_PENDING_CUSTOM_ID,
+        row=1,
+    )
+    async def reset_pending(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if not await self._ensure_owner(interaction):
+            return
+        if not await _ensure_kick_members_permission(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            result = await asyncio.to_thread(
+                self.bot.services.sync_service.admin_reset_pending_claims,
+            )
+        except Exception:
+            LOGGER.exception("Admin reset pending failed for global scope")
+            await interaction.followup.send(
+                "Could not reset pending tasks right now. Please try again.",
+                ephemeral=True,
+            )
+            return
+        touched_label = ", ".join(result.touched_rsns) if result.touched_rsns else "none"
+        touched_label = _truncate_text(touched_label, 700)
+        _audit_log(
+            interaction,
+            "admin_reset_pending_all",
+            reset_claims=result.reset_claims,
+            ready_rewards_synced=result.ready_rewards_synced,
+            cancelled_rewards_synced=result.cancelled_rewards_synced,
+            touched_rsns=len(result.touched_rsns),
+        )
+        await interaction.followup.send(
+            (
+                f"Reset **{result.reset_claims}** pending task claim(s) across all users.\n"
+                f"RSNs touched: `{touched_label}`\n"
+                f"Reward sync: ready {result.ready_rewards_synced}, "
+                f"cancelled {result.cancelled_rewards_synced}."
+            ),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Clear Active Task",
+        style=discord.ButtonStyle.secondary,
+        custom_id=ADMIN_CLEAR_ACTIVE_CUSTOM_ID,
+        row=1,
+    )
+    async def clear_active_task(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        await self._open_modal(
+            interaction,
+            AdminClearActiveTaskModal(
+                self.bot,
+                default_target_user_id=self.default_target_user_id,
+            ),
+        )
+
+    @discord.ui.button(
+        label="Payout Board",
+        style=discord.ButtonStyle.secondary,
+        custom_id=ADMIN_PAYOUTS_CUSTOM_ID,
+        row=2,
+    )
+    async def payout_board(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if not await self._ensure_owner(interaction):
+            return
+        if not await _ensure_kick_members_permission(interaction):
+            return
+        _audit_log(interaction, "admin_payout_board_open")
+        await _open_admin_payout_board(
+            self.bot,
+            interaction,
+            owner_user_id=self.owner_user_id,
+        )
+
+    @discord.ui.button(
+        label="Refresh Panels",
+        style=discord.ButtonStyle.primary,
+        custom_id=ADMIN_REFRESH_PANELS_CUSTOM_ID,
+        row=2,
+    )
+    async def refresh_panels(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if not await self._ensure_owner(interaction):
+            return
+        if not await _ensure_kick_members_permission(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
+        status_lines: list[str] = []
+        has_error = False
+        panel_actions = [
+            ("Task panel", self.bot.ensure_task_panel_message),
+            ("Highscores panel", self.bot.ensure_highscores_panel_message),
+        ]
+        for panel_name, action in panel_actions:
+            try:
+                refreshed = await action()
+                status = "ok" if refreshed else "not configured"
+                status_lines.append(f"{panel_name}: {status}")
+            except Exception:
+                LOGGER.exception("Admin refresh failed for %s", panel_name)
+                has_error = True
+                status_lines.append(f"{panel_name}: error")
+        _audit_log(
+            interaction,
+            "admin_refresh_panels",
+            status="; ".join(status_lines),
+            has_error=has_error,
+        )
+        prefix = "Panel refresh completed." if not has_error else "Panel refresh completed with errors."
+        await interaction.followup.send(
+            f"{prefix}\n" + "\n".join(status_lines),
+            ephemeral=True,
+        )
+
+
 class RewardPayoutMarkPaidPickerView(discord.ui.View):
     def __init__(
         self,
@@ -1270,7 +1946,6 @@ class RewardPayoutMarkPaidPickerView(discord.ui.View):
             rsn=payout.rsn,
             reward=payout.reward_display_value,
         )
-        asyncio.create_task(_refresh_reward_payouts_panel(self.bot))
         await interaction.response.edit_message(
             content=f"Marked `{payout.rsn}` • **{payout.reward_display_value}** as paid.",
             view=None,
@@ -1345,29 +2020,54 @@ class RewardPayoutUndoPaidPickerView(discord.ui.View):
             rsn=payout.rsn,
             reward=payout.reward_display_value,
         )
-        asyncio.create_task(_refresh_reward_payouts_panel(self.bot))
         await interaction.response.edit_message(
             content=f"Moved `{payout.rsn}` • **{payout.reward_display_value}** back to unpaid.",
             view=None,
         )
 
 
-class RewardPayoutPanelView(discord.ui.View):
-    def __init__(self, bot: "RngCABot", *, has_unpaid: bool = True, has_paid: bool = True) -> None:
-        super().__init__(timeout=None)
+class AdminRewardPayoutsView(discord.ui.View):
+    def __init__(
+        self,
+        bot: "RngCABot",
+        *,
+        owner_user_id: str,
+        has_unpaid: bool = True,
+        has_paid: bool = True,
+    ) -> None:
+        super().__init__(timeout=900)
         self.bot = bot
+        self.owner_user_id = owner_user_id
         self.mark_paid.disabled = not has_unpaid
         self.undo_paid.disabled = not has_paid
 
+    async def _ensure_owner(self, interaction: discord.Interaction) -> bool:
+        if str(interaction.user.id) == self.owner_user_id:
+            return True
+        await interaction.response.send_message("This payout board belongs to another user.", ephemeral=True)
+        return False
+
     @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary, custom_id=PAYOUTS_REFRESH_CUSTOM_ID)
     async def refresh(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if not await self._ensure_owner(interaction):
+            return
+        if not await _ensure_kick_members_permission(interaction):
+            return
         await interaction.response.defer(ephemeral=True)
-        await _refresh_reward_payouts_panel(self.bot)
-        _audit_log(interaction, "reward_payouts_refresh")
-        await interaction.followup.send("Reward payout board refreshed.", ephemeral=True)
+        _audit_log(interaction, "admin_payout_board_refresh")
+        await _open_admin_payout_board(
+            self.bot,
+            interaction,
+            owner_user_id=self.owner_user_id,
+            edit_existing=True,
+        )
 
     @discord.ui.button(label="Mark Paid", style=discord.ButtonStyle.success, custom_id=PAYOUTS_MARK_PAID_CUSTOM_ID)
     async def mark_paid(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if not await self._ensure_owner(interaction):
+            return
+        if not await _ensure_kick_members_permission(interaction):
+            return
         await interaction.response.defer(ephemeral=True)
         try:
             summary = await asyncio.to_thread(
@@ -1396,6 +2096,10 @@ class RewardPayoutPanelView(discord.ui.View):
 
     @discord.ui.button(label="Undo Paid", style=discord.ButtonStyle.danger, custom_id=PAYOUTS_UNDO_PAID_CUSTOM_ID)
     async def undo_paid(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if not await self._ensure_owner(interaction):
+            return
+        if not await _ensure_kick_members_permission(interaction):
+            return
         await interaction.response.defer(ephemeral=True)
         try:
             summary = await asyncio.to_thread(
@@ -1431,35 +2135,40 @@ class RngCABot(commands.Bot):
         self.services = services
         self._panel_listener_view = GlobalTaskPanelView(self)
         self._highscores_listener_view = HighscoresPanelView(self)
-        self._reward_payouts_listener_view = RewardPayoutPanelView(self)
-        self._reward_payouts_refresh_task: asyncio.Task | None = None
+
+    def _register_app_commands(self) -> None:
+        @self.tree.command(name="admin", description="Open moderator controls")
+        @app_commands.guild_only()
+        @app_commands.default_permissions(kick_members=True)
+        @app_commands.describe(member="Optional member to prefill in admin actions")
+        async def admin_panel(interaction: discord.Interaction, member: discord.Member | None = None) -> None:
+            if not await _ensure_kick_members_permission(interaction):
+                return
+            default_target_user_id = str(member.id) if member is not None else None
+            _audit_log(
+                interaction,
+                "admin_panel_open",
+                default_target_user_id=default_target_user_id,
+            )
+            await interaction.response.send_message(
+                embed=_admin_panel_embed(default_target_user_id),
+                view=AdminPanelView(
+                    self,
+                    owner_user_id=str(interaction.user.id),
+                    default_target_user_id=default_target_user_id,
+                ),
+                ephemeral=True,
+            )
 
     async def setup_hook(self) -> None:
         self.add_view(self._panel_listener_view)
         self.add_view(self._highscores_listener_view)
-        self.add_view(self._reward_payouts_listener_view)
         self.tree.clear_commands(guild=None)
+        self._register_app_commands()
         try:
             await self.tree.sync()
         except Exception:
-            LOGGER.exception("Failed to sync empty command tree")
-
-    def start_reward_payouts_refresh_loop(self) -> None:
-        if self.settings.reward_payouts_channel_id is None:
-            return
-        if self._reward_payouts_refresh_task is not None and not self._reward_payouts_refresh_task.done():
-            return
-        self._reward_payouts_refresh_task = asyncio.create_task(self._reward_payouts_refresh_loop())
-
-    async def _reward_payouts_refresh_loop(self) -> None:
-        try:
-            while not self.is_closed():
-                await asyncio.sleep(PAYOUTS_REFRESH_INTERVAL_SECONDS)
-                await self.ensure_reward_payouts_panel_message()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            LOGGER.exception("Reward payouts refresh loop failed")
+            LOGGER.exception("Failed to sync command tree")
 
     def _get_panel_record(self, panel_key: str) -> dict | None:
         with self.services.sync_service.db.connection() as conn:
@@ -1569,21 +2278,6 @@ class RngCABot(commands.Bot):
             force_recreate=force_recreate,
         )
 
-    async def ensure_reward_payouts_panel_message(self, force_recreate: bool = False) -> bool:
-        summary = await asyncio.to_thread(_load_reward_payout_summary, self)
-        return await self._ensure_panel_message(
-            panel_key=PAYOUTS_PANEL_KEY,
-            channel_id=self.settings.reward_payouts_channel_id,
-            embed=_reward_payouts_embed(summary),
-            view=RewardPayoutPanelView(
-                self,
-                has_unpaid=summary.unpaid_count > 0,
-                has_paid=summary.paid_count > 0,
-            ),
-            panel_name="Reward payouts panel",
-            force_recreate=force_recreate,
-        )
-
     async def post_scan_status(self, result: ScanRunResult) -> None:
         LOGGER.info(
             f"Daily scan completed | run `{result.run_id}` | status `{result.status}` | "
@@ -1593,10 +2287,6 @@ class RngCABot(commands.Bot):
             await self.ensure_highscores_panel_message()
         except Exception:
             LOGGER.exception("Could not refresh highscores panel after scan")
-        try:
-            await self.ensure_reward_payouts_panel_message()
-        except Exception:
-            LOGGER.exception("Could not refresh reward payouts panel after scan")
 
 
 async def post_boss_image_mappings_once(
