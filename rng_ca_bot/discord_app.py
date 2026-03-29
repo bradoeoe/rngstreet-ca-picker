@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Sequence
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import discord
 from discord import app_commands
@@ -25,6 +26,7 @@ from .sync_service import (
     RandomTaskResult,
     RerollResult,
     SyncService,
+    TaskRollKeyIssue,
     UserRewardKeySummary,
     UserTaskProfileSummary,
 )
@@ -99,6 +101,31 @@ def _compact_reward_key(reward_key: str) -> str:
     if len(cleaned) <= 14:
         return cleaned
     return f"{cleaned[:10]}...{cleaned[-4:]}"
+
+
+def _task_roll_mode_label(mode: str) -> str:
+    normalized = (mode or "new").strip().casefold()
+    if normalized == "reroll":
+        return "Reroll active task"
+    return "New task"
+
+
+def _build_task_roll_url(base_url: str, *, issued: TaskRollKeyIssue) -> str:
+    fallback = "http://localhost:5173/?mode=task"
+    candidate = (base_url or "").strip() or fallback
+    try:
+        parsed = urlsplit(candidate)
+        if not parsed.scheme or not parsed.netloc:
+            raise ValueError("Task roll URL must include scheme and host")
+    except Exception:
+        parsed = urlsplit(fallback)
+
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=False)
+    query: dict[str, str] = {key: value for key, value in query_pairs}
+    query["mode"] = "task"
+    query["task_roll_key"] = issued.roll_key
+    encoded_query = urlencode(query)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, encoded_query, parsed.fragment))
 
 
 def _audit_log(interaction: discord.Interaction, event: str, **fields: object) -> None:
@@ -2137,6 +2164,137 @@ class RngCABot(commands.Bot):
         self._highscores_listener_view = HighscoresPanelView(self)
 
     def _register_app_commands(self) -> None:
+        @self.tree.command(name="taskroll", description="Generate a web key to roll a task")
+        @app_commands.describe(
+            mode="Choose whether this key rolls a new task or rerolls your active task",
+            rsn="Optional RSN (required when your Discord maps to multiple accounts)",
+        )
+        @app_commands.choices(
+            mode=[
+                app_commands.Choice(name="New task", value="new"),
+                app_commands.Choice(name="Reroll active task", value="reroll"),
+            ]
+        )
+        async def task_roll(
+            interaction: discord.Interaction,
+            mode: app_commands.Choice[str],
+            rsn: str | None = None,
+        ) -> None:
+            ephemeral = interaction.guild_id is not None
+            await interaction.response.defer(ephemeral=ephemeral)
+
+            discord_user_id = str(interaction.user.id)
+            requested_rsn = _normalize_optional_rsn(rsn or "")
+            roll_mode = (mode.value if mode is not None else "new").strip().casefold()
+            if roll_mode not in {"new", "reroll"}:
+                await interaction.followup.send("Choose either `new` or `reroll` for mode.", ephemeral=ephemeral)
+                return
+
+            try:
+                rsns = await asyncio.to_thread(
+                    self.services.sync_service.resolve_rsns_for_discord_user,
+                    discord_user_id,
+                )
+            except Exception:
+                LOGGER.exception("Could not resolve RSNs for task roll user %s", discord_user_id)
+                await interaction.followup.send(
+                    "Could not resolve your RSN mapping right now. Please try again shortly.",
+                    ephemeral=ephemeral,
+                )
+                return
+
+            if not rsns:
+                await interaction.followup.send(
+                    (
+                        "No RSN mapping found for your Discord ID. "
+                        "Ask an admin to set your `members.DISCORD_ID` and `members.RSN` mapping."
+                    ),
+                    ephemeral=ephemeral,
+                )
+                return
+
+            chosen_rsn: str | None = None
+            if requested_rsn is None:
+                if len(rsns) == 1:
+                    chosen_rsn = rsns[0]
+                else:
+                    preview = ", ".join(f"`{value}`" for value in rsns[:10])
+                    hidden = len(rsns) - min(len(rsns), 10)
+                    extra = f" (+{hidden} more)" if hidden > 0 else ""
+                    await interaction.followup.send(
+                        (
+                            "You have multiple linked accounts. Run `/taskroll` again and set the `rsn` option.\n"
+                            f"Accounts: {preview}{extra}"
+                        ),
+                        ephemeral=ephemeral,
+                    )
+                    return
+            else:
+                chosen_rsn = next((value for value in rsns if value.casefold() == requested_rsn.casefold()), None)
+                if chosen_rsn is None:
+                    preview = ", ".join(f"`{value}`" for value in rsns[:10])
+                    hidden = len(rsns) - min(len(rsns), 10)
+                    extra = f" (+{hidden} more)" if hidden > 0 else ""
+                    await interaction.followup.send(
+                        f"`{requested_rsn}` is not linked to your Discord user. Linked accounts: {preview}{extra}",
+                        ephemeral=ephemeral,
+                    )
+                    return
+
+            try:
+                issued = await asyncio.to_thread(
+                    self.services.sync_service.issue_task_roll_key,
+                    discord_user_id,
+                    rsn=chosen_rsn,
+                    roll_mode=roll_mode,
+                )
+            except Exception:
+                LOGGER.exception(
+                    "Task roll key issuance failed for user %s rsn %s mode %s",
+                    discord_user_id,
+                    chosen_rsn,
+                    roll_mode,
+                )
+                await interaction.followup.send(
+                    "Could not create a task roll key right now. Please try again.",
+                    ephemeral=ephemeral,
+                )
+                return
+
+            if issued is None:
+                await interaction.followup.send(
+                    "Could not create a task roll key for that account.",
+                    ephemeral=ephemeral,
+                )
+                return
+
+            roll_url = _build_task_roll_url(self.settings.task_roll_web_url, issued=issued)
+            mode_label = _task_roll_mode_label(issued.roll_mode)
+
+            _audit_log(
+                interaction,
+                "task_roll_key_issued",
+                rsn=issued.rsn,
+                mode=issued.roll_mode,
+                key=_compact_reward_key(issued.roll_key),
+            )
+
+            embed = discord.Embed(
+                title="Task Roll Key Ready",
+                description=(
+                    f"Roll type: **{mode_label}**\n"
+                    f"Account: `{issued.rsn}`\n"
+                    f"Key: `{issued.roll_key}`\n"
+                    f"[Open Task Roller]({roll_url})"
+                ),
+                color=discord.Color.from_rgb(232, 113, 38),
+                timestamp=datetime.now(UTC),
+            )
+            embed.set_footer(text="Each key is single-use. Use /taskroll anytime for another key.")
+            link_view = discord.ui.View(timeout=300)
+            link_view.add_item(discord.ui.Button(label="Open Task Roller", style=discord.ButtonStyle.link, url=roll_url))
+            await interaction.followup.send(embed=embed, view=link_view, ephemeral=ephemeral)
+
         @self.tree.command(name="admin", description="Open moderator controls")
         @app_commands.guild_only()
         @app_commands.default_permissions(kick_members=True)

@@ -8,6 +8,8 @@ from flask import Flask, jsonify, request, send_from_directory
 from rng_ca_bot.config import load_settings
 from rng_ca_bot.db import Database
 from rng_ca_bot.rewards import format_reward_display, redeem_reward_key_payload
+from rng_ca_bot.sync_service import SyncService
+from rng_ca_bot.task_rolls import build_task_reel, task_payload
 
 LOGGER = logging.getLogger(__name__)
 
@@ -20,9 +22,11 @@ def create_app() -> Flask:
     settings = load_settings()
     db = Database(settings)
     db.run_migrations(MIGRATIONS_DIR)
+    sync_service = SyncService(settings=settings, db=db)
 
     app = Flask(__name__, static_folder=None)
     app.config["db"] = db
+    app.config["sync_service"] = sync_service
     app.config["reward_admin_api_key"] = settings.reward_admin_api_key
 
     def _serialize_reward_row(row: dict) -> dict:
@@ -95,6 +99,66 @@ def create_app() -> Flask:
         reward_key = str(payload.get("reward_key") or "").strip()
         status_code, response = redeem_reward_key_payload(app.config["db"], reward_key)
         return jsonify(response), int(status_code)
+
+    @app.route("/api/task-roll/redeem", methods=["POST", "OPTIONS"])
+    def api_task_roll_redeem():
+        if request.method == "OPTIONS":
+            return ("", 204)
+
+        payload = request.get_json(silent=True) or {}
+        task_roll_key = str(payload.get("task_roll_key") or "").strip()
+        result = app.config["sync_service"].redeem_task_roll_key(task_roll_key)
+
+        if result.status == "ok" and result.task is not None:
+            reel, selected_index = build_task_reel(app.config["sync_service"], result.task)
+            return (
+                jsonify(
+                    {
+                        "status": "ok",
+                        "message": result.message,
+                        "task_roll_key": result.roll_key,
+                        "roll_mode": result.roll_mode,
+                        "rsn": result.rsn,
+                        "task": task_payload(result.task, rerolls_remaining=result.rerolls_remaining),
+                        "reel": reel,
+                        "selected_index": selected_index,
+                    }
+                ),
+                200,
+            )
+
+        if result.status == "used":
+            response_payload = {
+                "status": "used",
+                "message": result.message,
+                "task_roll_key": result.roll_key,
+                "roll_mode": result.roll_mode,
+                "rsn": result.rsn,
+            }
+            if result.task is not None:
+                response_payload["task"] = task_payload(result.task, rerolls_remaining=result.rerolls_remaining)
+            return jsonify(response_payload), 409
+
+        status_code = {
+            "invalid": 400,
+            "cancelled": 410,
+            "expired": 410,
+            "no_active": 409,
+            "no_alternative": 409,
+            "no_task": 409,
+        }.get(result.status, 400)
+        return (
+            jsonify(
+                {
+                    "status": result.status,
+                    "message": result.message,
+                    "task_roll_key": result.roll_key,
+                    "roll_mode": result.roll_mode,
+                    "rsn": result.rsn,
+                }
+            ),
+            status_code,
+        )
 
     @app.get("/api/admin/payouts")
     def api_admin_payouts():

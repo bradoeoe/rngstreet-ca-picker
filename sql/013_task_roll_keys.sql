@@ -1,0 +1,21 @@
+CREATE TABLE IF NOT EXISTS ca_task_roll_keys (
+  id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  roll_key VARCHAR(48) NOT NULL,
+  discord_user_id VARCHAR(32) NOT NULL,
+  rsn VARCHAR(32) NOT NULL,
+  roll_mode VARCHAR(16) NOT NULL DEFAULT 'new',
+  status VARCHAR(16) NOT NULL DEFAULT 'ready',
+  result_task_id INT NULL,
+  result_task_name VARCHAR(255) NULL,
+  result_tier_label VARCHAR(32) NULL,
+  result_points INT NULL,
+  result_npc VARCHAR(255) NULL,
+  result_npc_image_url VARCHAR(512) NULL,
+  result_rerolls_remaining INT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  used_at DATETIME NULL,
+  expires_at DATETIME NULL,
+  UNIQUE KEY uq_ca_task_roll_keys_key (roll_key),
+  KEY idx_ca_task_roll_keys_owner (discord_user_id, rsn, created_at),
+  KEY idx_ca_task_roll_keys_status (status, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

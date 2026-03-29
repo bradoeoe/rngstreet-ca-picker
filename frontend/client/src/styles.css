@@ -59,6 +59,35 @@ h1 {
   max-width: 680px;
 }
 
+.mode-toggle {
+  margin-top: 14px;
+  display: inline-flex;
+  gap: 8px;
+  padding: 4px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.mode-toggle button {
+  min-height: 36px;
+  padding: 0 14px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.74);
+  border: 1px solid transparent;
+}
+
+.mode-toggle button.active {
+  background: linear-gradient(180deg, #ef8f4f, #d45f1d);
+  color: #fff8ef;
+  border-color: rgba(232, 113, 38, 0.66);
+}
+
 .content {
   padding: 24px 28px 32px;
 }

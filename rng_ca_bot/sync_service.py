@@ -229,6 +229,29 @@ class RewardPayoutSummary:
 
 
 @dataclass(slots=True)
+class TaskRollKeyIssue:
+    roll_key: str
+    discord_user_id: str
+    rsn: str
+    roll_mode: str
+    status: str
+    created_at: datetime | None
+
+
+@dataclass(slots=True)
+class TaskRollRedeemResult:
+    status: str
+    roll_key: str
+    discord_user_id: str
+    rsn: str
+    roll_mode: str
+    task: RandomTaskResult | None
+    rerolls_remaining: int | None
+    used_at: datetime | None
+    message: str
+
+
+@dataclass(slots=True)
 class RewardKeyStatusEntry:
     reward_key: str
     rsn: str
@@ -1443,6 +1466,280 @@ class SyncService:
 
         return self._build_reward_payout_entry(row)
 
+    def issue_task_roll_key(
+        self,
+        discord_user_id: str,
+        *,
+        rsn: str | None = None,
+        roll_mode: str = "new",
+    ) -> TaskRollKeyIssue | None:
+        normalized_user_id = str(discord_user_id).strip()
+        normalized_rsn = (rsn or "").strip()
+        normalized_mode = (roll_mode or "new").strip().casefold()
+        if normalized_mode not in {"new", "reroll"}:
+            raise ValueError(f"Unsupported roll mode: {roll_mode}")
+
+        with self.db.connection() as conn:
+            target_rsn = normalized_rsn
+            if not target_rsn:
+                target_rsn = self.db.get_rsn_for_discord_user(conn, normalized_user_id) or ""
+            if not target_rsn:
+                return None
+            created = self.db.create_task_roll_key(
+                conn,
+                discord_user_id=normalized_user_id,
+                rsn=target_rsn,
+                roll_mode=normalized_mode,
+            )
+            conn.commit()
+
+        return TaskRollKeyIssue(
+            roll_key=str(created.get("roll_key") or "").strip(),
+            discord_user_id=str(created.get("discord_user_id") or "").strip(),
+            rsn=str(created.get("rsn") or "").strip(),
+            roll_mode=str(created.get("roll_mode") or "").strip().casefold() or "new",
+            status=str(created.get("status") or "").strip().casefold() or "ready",
+            created_at=created.get("created_at") if isinstance(created.get("created_at"), datetime) else None,
+        )
+
+    def _task_from_task_roll_row(self, row: Mapping[str, object]) -> RandomTaskResult | None:
+        task_id_raw = row.get("result_task_id")
+        if task_id_raw is None:
+            return None
+        task_name = str(row.get("result_task_name") or "").strip()
+        if not task_name:
+            return None
+        return RandomTaskResult(
+            task_id=int(task_id_raw),
+            task_name=task_name,
+            task_description=None,
+            npc=str(row.get("result_npc") or "").strip() or None,
+            npc_url=None,
+            npc_image_url=str(row.get("result_npc_image_url") or "").strip() or None,
+            task_type=None,
+            tier_label=str(row.get("result_tier_label") or "").strip() or None,
+            points=int(row.get("result_points") or 0) if row.get("result_points") is not None else None,
+            eligible_count=0,
+        )
+
+    def redeem_task_roll_key(self, roll_key: str) -> TaskRollRedeemResult:
+        normalized_key = (roll_key or "").strip().upper()
+        if not normalized_key:
+            return TaskRollRedeemResult(
+                status="invalid",
+                roll_key="",
+                discord_user_id="",
+                rsn="",
+                roll_mode="new",
+                task=None,
+                rerolls_remaining=None,
+                used_at=None,
+                message="Enter a task roll key first.",
+            )
+
+        with self.db.connection() as conn:
+            row = self.db.get_task_roll_key(conn, normalized_key, for_update=True)
+            if row is None:
+                conn.rollback()
+                return TaskRollRedeemResult(
+                    status="invalid",
+                    roll_key=normalized_key,
+                    discord_user_id="",
+                    rsn="",
+                    roll_mode="new",
+                    task=None,
+                    rerolls_remaining=None,
+                    used_at=None,
+                    message="That task roll key does not exist.",
+                )
+
+            roll_mode = str(row.get("roll_mode") or "").strip().casefold() or "new"
+            status = str(row.get("status") or "").strip().casefold() or "ready"
+            discord_user_id = str(row.get("discord_user_id") or "").strip()
+            rsn = str(row.get("rsn") or "").strip()
+
+            if status == "used":
+                task = self._task_from_task_roll_row(row)
+                conn.rollback()
+                return TaskRollRedeemResult(
+                    status="used",
+                    roll_key=normalized_key,
+                    discord_user_id=discord_user_id,
+                    rsn=rsn,
+                    roll_mode=roll_mode,
+                    task=task,
+                    rerolls_remaining=(
+                        int(row.get("result_rerolls_remaining") or 0)
+                        if row.get("result_rerolls_remaining") is not None
+                        else None
+                    ),
+                    used_at=row.get("used_at") if isinstance(row.get("used_at"), datetime) else None,
+                    message="That task roll key has already been used.",
+                )
+            if status == "cancelled":
+                conn.rollback()
+                return TaskRollRedeemResult(
+                    status="cancelled",
+                    roll_key=normalized_key,
+                    discord_user_id=discord_user_id,
+                    rsn=rsn,
+                    roll_mode=roll_mode,
+                    task=None,
+                    rerolls_remaining=None,
+                    used_at=None,
+                    message="That task roll key was cancelled.",
+                )
+            if status == "expired":
+                conn.rollback()
+                return TaskRollRedeemResult(
+                    status="expired",
+                    roll_key=normalized_key,
+                    discord_user_id=discord_user_id,
+                    rsn=rsn,
+                    roll_mode=roll_mode,
+                    task=None,
+                    rerolls_remaining=None,
+                    used_at=None,
+                    message="That task roll key has expired.",
+                )
+            if status != "ready":
+                conn.rollback()
+                return TaskRollRedeemResult(
+                    status="invalid",
+                    roll_key=normalized_key,
+                    discord_user_id=discord_user_id,
+                    rsn=rsn,
+                    roll_mode=roll_mode,
+                    task=None,
+                    rerolls_remaining=None,
+                    used_at=None,
+                    message="That task roll key is not in a usable state.",
+                )
+
+            expires_at = row.get("expires_at")
+            if isinstance(expires_at, datetime) and expires_at <= datetime.now():
+                self.db.cancel_task_roll_key(conn, normalized_key, status="expired")
+                conn.commit()
+                return TaskRollRedeemResult(
+                    status="expired",
+                    roll_key=normalized_key,
+                    discord_user_id=discord_user_id,
+                    rsn=rsn,
+                    roll_mode=roll_mode,
+                    task=None,
+                    rerolls_remaining=None,
+                    used_at=None,
+                    message="That task roll key has expired.",
+                )
+
+            if roll_mode == "reroll":
+                reroll = self._reroll_active_task_with_conn(
+                    conn,
+                    discord_user_id,
+                    rsn,
+                    consume_reroll=False,
+                )
+                if reroll is None:
+                    conn.rollback()
+                    return TaskRollRedeemResult(
+                        status="no_active",
+                        roll_key=normalized_key,
+                        discord_user_id=discord_user_id,
+                        rsn=rsn,
+                        roll_mode=roll_mode,
+                        task=None,
+                        rerolls_remaining=None,
+                        used_at=None,
+                        message=f"No active task found for `{rsn}` to reroll.",
+                    )
+                if reroll.replacement_task is None:
+                    conn.rollback()
+                    return TaskRollRedeemResult(
+                        status="no_alternative",
+                        roll_key=normalized_key,
+                        discord_user_id=discord_user_id,
+                        rsn=rsn,
+                        roll_mode=roll_mode,
+                        task=None,
+                        rerolls_remaining=reroll.rerolls_remaining,
+                        used_at=None,
+                        message=f"No alternative eligible reroll task found for `{rsn}`.",
+                    )
+                outcome_task = reroll.replacement_task
+                rerolls_remaining = reroll.rerolls_remaining
+            else:
+                assignment = self._get_or_assign_active_task_with_conn(conn, discord_user_id, rsn)
+                if assignment is None:
+                    conn.rollback()
+                    return TaskRollRedeemResult(
+                        status="no_task",
+                        roll_key=normalized_key,
+                        discord_user_id=discord_user_id,
+                        rsn=rsn,
+                        roll_mode=roll_mode,
+                        task=None,
+                        rerolls_remaining=None,
+                        used_at=None,
+                        message=f"No eligible tasks found for `{rsn}`.",
+                    )
+                outcome_task = assignment.task
+                rerolls_remaining = assignment.rerolls_remaining
+
+            updated = self.db.mark_task_roll_key_used(
+                conn,
+                normalized_key,
+                task_id=outcome_task.task_id,
+                task_name=outcome_task.task_name,
+                tier_label=outcome_task.tier_label,
+                points=outcome_task.points,
+                npc=outcome_task.npc,
+                npc_image_url=outcome_task.npc_image_url,
+                rerolls_remaining=rerolls_remaining,
+            )
+            if updated is None:
+                latest = self.db.get_task_roll_key(conn, normalized_key, for_update=True)
+                conn.rollback()
+                if latest is not None and str(latest.get("status") or "").strip().casefold() == "used":
+                    return TaskRollRedeemResult(
+                        status="used",
+                        roll_key=normalized_key,
+                        discord_user_id=discord_user_id,
+                        rsn=rsn,
+                        roll_mode=roll_mode,
+                        task=self._task_from_task_roll_row(latest),
+                        rerolls_remaining=(
+                            int(latest.get("result_rerolls_remaining") or 0)
+                            if latest.get("result_rerolls_remaining") is not None
+                            else None
+                        ),
+                        used_at=latest.get("used_at") if isinstance(latest.get("used_at"), datetime) else None,
+                        message="That task roll key has already been used.",
+                    )
+                return TaskRollRedeemResult(
+                    status="invalid",
+                    roll_key=normalized_key,
+                    discord_user_id=discord_user_id,
+                    rsn=rsn,
+                    roll_mode=roll_mode,
+                    task=None,
+                    rerolls_remaining=None,
+                    used_at=None,
+                    message="Could not finalize that task roll key.",
+                )
+
+            conn.commit()
+            return TaskRollRedeemResult(
+                status="ok",
+                roll_key=normalized_key,
+                discord_user_id=discord_user_id,
+                rsn=rsn,
+                roll_mode=roll_mode,
+                task=outcome_task,
+                rerolls_remaining=rerolls_remaining,
+                used_at=updated.get("used_at") if isinstance(updated.get("used_at"), datetime) else None,
+                message="Task rolled successfully.",
+            )
+
     def _award_tier_promotion_rerolls_if_due(
         self,
         conn,
@@ -1482,89 +1779,97 @@ class SyncService:
         reward_batches = int(profile["completion_reward_batches"] or 0)
         return rerolls_available, reward_batches
 
-    def get_or_assign_active_task(self, discord_user_id: str, rsn_override: str | None = None) -> ActiveTaskAssignment | None:
-        with self.db.connection() as conn:
-            awarded_rerolls, _, _ = self._award_due_rerolls(conn, discord_user_id)
-            if awarded_rerolls > 0:
-                conn.commit()
-            rerolls_available, _reward_batches = self._get_user_profile_snapshot(conn, discord_user_id)
+    def _get_or_assign_active_task_with_conn(
+        self,
+        conn,
+        discord_user_id: str,
+        rsn_override: str | None = None,
+    ) -> ActiveTaskAssignment | None:
+        awarded_rerolls, _, _ = self._award_due_rerolls(conn, discord_user_id)
+        if awarded_rerolls > 0:
+            conn.commit()
+        rerolls_available, _reward_batches = self._get_user_profile_snapshot(conn, discord_user_id)
 
-            rsn = (rsn_override or "").strip()
-            if not rsn:
-                rsn = self.db.get_rsn_for_discord_user(conn, discord_user_id) or ""
-            if not rsn:
-                return None
+        rsn = (rsn_override or "").strip()
+        if not rsn:
+            rsn = self.db.get_rsn_for_discord_user(conn, discord_user_id) or ""
+        if not rsn:
+            return None
 
-            latest_scan_id = self.db.get_latest_completed_scan_run_id(conn)
-            current_tier = self._get_current_tier_threshold(conn, rsn)
-            current_tier_rank = current_tier.rank if current_tier is not None else 0
-            active = self.db.get_active_task(conn, discord_user_id, rsn)
-            if active is not None:
-                active_rsn = str(active["rsn"]).strip()
-                active_task_id = int(active["task_id"])
-                completion_state = self.db.get_task_completion_state(conn, active_rsn, active_task_id)
-                active_incomplete_ids = self.db.get_incomplete_task_ids(conn, active_rsn)
-                claimed_ids = self.db.get_claimed_task_ids_for_scan(
-                    conn,
-                    discord_user_id=discord_user_id,
-                    rsn=active_rsn,
-                    scan_run_id=latest_scan_id,
-                )
-                eligible_ids = compute_eligible_task_ids(
-                    active_incomplete_ids,
-                    claimed_ids,
-                )
-                eligible_ids = self._filter_assignable_task_ids(
-                    conn,
-                    eligible_ids,
-                    incomplete_ids=active_incomplete_ids,
-                    current_tier_rank=current_tier_rank,
-                )
-                if (
-                    active_rsn.casefold() == rsn.casefold()
-                    and completion_state is False
-                    and active_task_id in set(eligible_ids)
-                ):
-                    return ActiveTaskAssignment(
-                        rsn=active_rsn,
-                        task=self._build_task_result(conn, active_task_id, len(active_incomplete_ids)),
-                        reused_existing=True,
-                        rerolls_remaining=rerolls_available,
-                    )
-                self.db.clear_active_task(conn, discord_user_id, rsn)
-                conn.commit()
-
-            incomplete_ids = self.db.get_incomplete_task_ids(conn, rsn)
+        latest_scan_id = self.db.get_latest_completed_scan_run_id(conn)
+        current_tier = self._get_current_tier_threshold(conn, rsn)
+        current_tier_rank = current_tier.rank if current_tier is not None else 0
+        active = self.db.get_active_task(conn, discord_user_id, rsn)
+        if active is not None:
+            active_rsn = str(active["rsn"]).strip()
+            active_task_id = int(active["task_id"])
+            completion_state = self.db.get_task_completion_state(conn, active_rsn, active_task_id)
+            active_incomplete_ids = self.db.get_incomplete_task_ids(conn, active_rsn)
             claimed_ids = self.db.get_claimed_task_ids_for_scan(
                 conn,
                 discord_user_id=discord_user_id,
-                rsn=rsn,
+                rsn=active_rsn,
                 scan_run_id=latest_scan_id,
+            )
+            eligible_ids = compute_eligible_task_ids(
+                active_incomplete_ids,
+                claimed_ids,
             )
             eligible_ids = self._filter_assignable_task_ids(
                 conn,
-                compute_eligible_task_ids(incomplete_ids, claimed_ids),
-                incomplete_ids=incomplete_ids,
+                eligible_ids,
+                incomplete_ids=active_incomplete_ids,
                 current_tier_rank=current_tier_rank,
             )
-            if not eligible_ids:
-                return None
-
-            task_id = self._pick_weighted_task_id(conn, eligible_ids)
-            self.db.upsert_active_task(
-                conn,
-                discord_user_id=discord_user_id,
-                rsn=rsn,
-                task_id=task_id,
-                assigned_scan_run_id=latest_scan_id,
-            )
+            if (
+                active_rsn.casefold() == rsn.casefold()
+                and completion_state is False
+                and active_task_id in set(eligible_ids)
+            ):
+                return ActiveTaskAssignment(
+                    rsn=active_rsn,
+                    task=self._build_task_result(conn, active_task_id, len(active_incomplete_ids)),
+                    reused_existing=True,
+                    rerolls_remaining=rerolls_available,
+                )
+            self.db.clear_active_task(conn, discord_user_id, rsn)
             conn.commit()
-            return ActiveTaskAssignment(
-                rsn=rsn,
-                task=self._build_task_result(conn, task_id, len(incomplete_ids)),
-                reused_existing=False,
-                rerolls_remaining=rerolls_available,
-            )
+
+        incomplete_ids = self.db.get_incomplete_task_ids(conn, rsn)
+        claimed_ids = self.db.get_claimed_task_ids_for_scan(
+            conn,
+            discord_user_id=discord_user_id,
+            rsn=rsn,
+            scan_run_id=latest_scan_id,
+        )
+        eligible_ids = self._filter_assignable_task_ids(
+            conn,
+            compute_eligible_task_ids(incomplete_ids, claimed_ids),
+            incomplete_ids=incomplete_ids,
+            current_tier_rank=current_tier_rank,
+        )
+        if not eligible_ids:
+            return None
+
+        task_id = self._pick_weighted_task_id(conn, eligible_ids)
+        self.db.upsert_active_task(
+            conn,
+            discord_user_id=discord_user_id,
+            rsn=rsn,
+            task_id=task_id,
+            assigned_scan_run_id=latest_scan_id,
+        )
+        conn.commit()
+        return ActiveTaskAssignment(
+            rsn=rsn,
+            task=self._build_task_result(conn, task_id, len(incomplete_ids)),
+            reused_existing=False,
+            rerolls_remaining=rerolls_available,
+        )
+
+    def get_or_assign_active_task(self, discord_user_id: str, rsn_override: str | None = None) -> ActiveTaskAssignment | None:
+        with self.db.connection() as conn:
+            return self._get_or_assign_active_task_with_conn(conn, discord_user_id, rsn_override)
 
     def resolve_rsn_for_discord_user(self, discord_user_id: str) -> str | None:
         with self.db.connection() as conn:
@@ -1842,55 +2147,62 @@ class SyncService:
             live_verified=live_verified,
         )
 
-    def reroll_active_task(self, discord_user_id: str, rsn: str) -> RerollResult | None:
-        with self.db.connection() as conn:
-            active = self.db.get_active_task(conn, discord_user_id, rsn)
-            if active is None:
-                return None
+    def _reroll_active_task_with_conn(
+        self,
+        conn,
+        discord_user_id: str,
+        rsn: str,
+        *,
+        consume_reroll: bool = True,
+    ) -> RerollResult | None:
+        active = self.db.get_active_task(conn, discord_user_id, rsn)
+        if active is None:
+            return None
 
-            task_id = int(active["task_id"])
-            completion_state = self.db.get_task_completion_state(conn, rsn, task_id)
-            if completion_state is not False:
-                self.db.clear_active_task(conn, discord_user_id, rsn)
-                conn.commit()
-                return None
+        task_id = int(active["task_id"])
+        completion_state = self.db.get_task_completion_state(conn, rsn, task_id)
+        if completion_state is not False:
+            self.db.clear_active_task(conn, discord_user_id, rsn)
+            conn.commit()
+            return None
 
-            latest_scan_id = self.db.get_latest_completed_scan_run_id(conn)
-            current_tier = self._get_current_tier_threshold(conn, rsn)
-            current_tier_rank = current_tier.rank if current_tier is not None else 0
-            incomplete_ids = self.db.get_incomplete_task_ids(conn, rsn)
-            claimed_ids = self.db.get_claimed_task_ids_for_scan(
-                conn,
-                discord_user_id=discord_user_id,
+        latest_scan_id = self.db.get_latest_completed_scan_run_id(conn)
+        current_tier = self._get_current_tier_threshold(conn, rsn)
+        current_tier_rank = current_tier.rank if current_tier is not None else 0
+        incomplete_ids = self.db.get_incomplete_task_ids(conn, rsn)
+        claimed_ids = self.db.get_claimed_task_ids_for_scan(
+            conn,
+            discord_user_id=discord_user_id,
+            rsn=rsn,
+            scan_run_id=latest_scan_id,
+        )
+        eligible_ids = self._filter_assignable_task_ids(
+            conn,
+            compute_eligible_task_ids(incomplete_ids, claimed_ids),
+            incomplete_ids=incomplete_ids,
+            current_tier_rank=current_tier_rank,
+        )
+        current_task = self._build_task_result(conn, task_id, len(incomplete_ids))
+        metadata_by_id = self.db.get_task_metadata_for_ids(conn, sorted(set(eligible_ids) | {task_id}))
+        candidates = filter_reroll_candidate_ids(
+            task_id,
+            eligible_ids,
+            metadata_by_id,
+        )
+        awarded_rerolls, _, _ = self._award_due_rerolls(conn, discord_user_id)
+        if awarded_rerolls > 0:
+            conn.commit()
+        rerolls_available, _reward_batches = self._get_user_profile_snapshot(conn, discord_user_id)
+
+        if not candidates:
+            return RerollResult(
                 rsn=rsn,
-                scan_run_id=latest_scan_id,
+                previous_task=current_task,
+                replacement_task=None,
+                rerolls_remaining=rerolls_available,
             )
-            eligible_ids = self._filter_assignable_task_ids(
-                conn,
-                compute_eligible_task_ids(incomplete_ids, claimed_ids),
-                incomplete_ids=incomplete_ids,
-                current_tier_rank=current_tier_rank,
-            )
-            current_task = self._build_task_result(conn, task_id, len(incomplete_ids))
-            metadata_by_id = self.db.get_task_metadata_for_ids(conn, sorted(set(eligible_ids) | {task_id}))
-            candidates = filter_reroll_candidate_ids(
-                task_id,
-                eligible_ids,
-                metadata_by_id,
-            )
-            awarded_rerolls, _, _ = self._award_due_rerolls(conn, discord_user_id)
-            if awarded_rerolls > 0:
-                conn.commit()
-            rerolls_available, _reward_batches = self._get_user_profile_snapshot(conn, discord_user_id)
 
-            if not candidates:
-                return RerollResult(
-                    rsn=rsn,
-                    previous_task=current_task,
-                    replacement_task=None,
-                    rerolls_remaining=rerolls_available,
-                )
-
+        if consume_reroll:
             profile = self.db.get_user_task_profile(conn, discord_user_id, for_update=True)
             rerolls_available = int(profile["rerolls_available"] or 0)
             if rerolls_available <= 0:
@@ -1901,29 +2213,34 @@ class SyncService:
                     rerolls_remaining=0,
                 )
 
-            next_task_id = self._pick_weighted_task_id(conn, candidates)
-            self.db.upsert_active_task(
-                conn,
-                discord_user_id=discord_user_id,
-                rsn=rsn,
-                task_id=next_task_id,
-                assigned_scan_run_id=latest_scan_id,
-            )
+        next_task_id = self._pick_weighted_task_id(conn, candidates)
+        self.db.upsert_active_task(
+            conn,
+            discord_user_id=discord_user_id,
+            rsn=rsn,
+            task_id=next_task_id,
+            assigned_scan_run_id=latest_scan_id,
+        )
+        if consume_reroll:
             rerolls_available -= 1
             self.db.update_user_task_profile(
                 conn,
                 discord_user_id,
                 rerolls_available=rerolls_available,
             )
-            conn.commit()
+        conn.commit()
 
-            replacement = self._build_task_result(conn, next_task_id, len(incomplete_ids))
-            return RerollResult(
-                rsn=rsn,
-                previous_task=current_task,
-                replacement_task=replacement,
-                rerolls_remaining=rerolls_available,
-            )
+        replacement = self._build_task_result(conn, next_task_id, len(incomplete_ids))
+        return RerollResult(
+            rsn=rsn,
+            previous_task=current_task,
+            replacement_task=replacement,
+            rerolls_remaining=rerolls_available,
+        )
+
+    def reroll_active_task(self, discord_user_id: str, rsn: str) -> RerollResult | None:
+        with self.db.connection() as conn:
+            return self._reroll_active_task_with_conn(conn, discord_user_id, rsn, consume_reroll=True)
 
     def verify_task_live(
         self,

@@ -29,8 +29,10 @@ USER_TASK_PROFILES_TABLE = "ca_user_task_profiles"
 BOSS_COMPLETION_REWARDS_TABLE = "ca_boss_completion_reroll_rewards"
 RSN_TIER_REWARDS_TABLE = "ca_rsn_tier_rewards"
 REWARDS_TABLE = "ca_rewards"
+TASK_ROLL_KEYS_TABLE = "ca_task_roll_keys"
 
 _REWARD_KEY_ALPHABET = string.ascii_uppercase + string.digits
+_TASK_ROLL_KEY_ALPHABET = string.ascii_uppercase + string.digits
 
 PREFIX_RENAMES: tuple[tuple[str, str], ...] = (
     ("scan_runs", SCAN_RUNS_TABLE),
@@ -835,6 +837,149 @@ class Database:
             tuple(params),
         )
         return int(cursor.rowcount or 0), affected_rsns
+
+    def _generate_task_roll_key(self) -> str:
+        parts = ["".join(secrets.choice(_TASK_ROLL_KEY_ALPHABET) for _ in range(4)) for _ in range(3)]
+        return f"TASK-{'-'.join(parts)}"
+
+    def get_task_roll_key(
+        self,
+        conn: MySQLConnection,
+        roll_key: str,
+        *,
+        for_update: bool = False,
+    ) -> dict | None:
+        cursor = conn.cursor(dictionary=True)
+        query = f"""
+            SELECT
+                id,
+                roll_key,
+                discord_user_id,
+                rsn,
+                roll_mode,
+                status,
+                result_task_id,
+                result_task_name,
+                result_tier_label,
+                result_points,
+                result_npc,
+                result_npc_image_url,
+                result_rerolls_remaining,
+                created_at,
+                used_at,
+                expires_at
+            FROM {TASK_ROLL_KEYS_TABLE}
+            WHERE roll_key = %s
+        """
+        if for_update:
+            query += " FOR UPDATE"
+        cursor.execute(query, (roll_key,))
+        return cursor.fetchone()
+
+    def create_task_roll_key(
+        self,
+        conn: MySQLConnection,
+        *,
+        discord_user_id: str,
+        rsn: str,
+        roll_mode: str = "new",
+        expires_at: datetime | None = None,
+    ) -> dict:
+        normalized_mode = (roll_mode or "new").strip().casefold()
+        if normalized_mode not in {"new", "reroll"}:
+            raise ValueError(f"Unsupported roll mode: {roll_mode}")
+
+        for _ in range(10):
+            roll_key = self._generate_task_roll_key()
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    f"""
+                    INSERT INTO {TASK_ROLL_KEYS_TABLE} (
+                        roll_key,
+                        discord_user_id,
+                        rsn,
+                        roll_mode,
+                        status,
+                        expires_at
+                    )
+                    VALUES (%s, %s, %s, %s, 'ready', %s)
+                    """,
+                    (
+                        roll_key,
+                        discord_user_id,
+                        rsn,
+                        normalized_mode,
+                        expires_at,
+                    ),
+                )
+                created = self.get_task_roll_key(conn, roll_key, for_update=True)
+                if created is None:
+                    raise RuntimeError(f"Could not reload task roll key row for {roll_key}")
+                return created
+            except mysql.connector.IntegrityError:
+                continue
+
+        raise RuntimeError("Could not generate a unique task roll key")
+
+    def mark_task_roll_key_used(
+        self,
+        conn: MySQLConnection,
+        roll_key: str,
+        *,
+        task_id: int,
+        task_name: str,
+        tier_label: str | None,
+        points: int | None,
+        npc: str | None,
+        npc_image_url: str | None,
+        rerolls_remaining: int,
+    ) -> dict | None:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            UPDATE {TASK_ROLL_KEYS_TABLE}
+            SET status = 'used',
+                result_task_id = %s,
+                result_task_name = %s,
+                result_tier_label = %s,
+                result_points = %s,
+                result_npc = %s,
+                result_npc_image_url = %s,
+                result_rerolls_remaining = %s,
+                used_at = CURRENT_TIMESTAMP
+            WHERE roll_key = %s
+              AND status = 'ready'
+            """,
+            (
+                int(task_id),
+                task_name,
+                tier_label,
+                int(points) if points is not None else None,
+                npc,
+                npc_image_url,
+                max(int(rerolls_remaining), 0),
+                roll_key,
+            ),
+        )
+        if int(cursor.rowcount or 0) <= 0:
+            return None
+        return self.get_task_roll_key(conn, roll_key, for_update=True)
+
+    def cancel_task_roll_key(self, conn: MySQLConnection, roll_key: str, *, status: str = "cancelled") -> None:
+        normalized_status = (status or "cancelled").strip().casefold()
+        if normalized_status not in {"cancelled", "expired"}:
+            raise ValueError(f"Unsupported task roll key status: {status}")
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            UPDATE {TASK_ROLL_KEYS_TABLE}
+            SET status = %s
+            WHERE roll_key = %s
+              AND status = 'ready'
+            """,
+            (normalized_status, roll_key),
+        )
 
     def _generate_reward_key(self) -> str:
         parts = ["".join(secrets.choice(_REWARD_KEY_ALPHABET) for _ in range(4)) for _ in range(4)]
