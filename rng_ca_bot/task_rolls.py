@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import random
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from .sync_service import RandomTaskResult
 
@@ -32,6 +32,9 @@ def task_payload(task: RandomTaskResult, *, rerolls_remaining: int | None = None
     points = int(task.points) if task.points is not None else None
     tier_label = (task.tier_label or "Unknown").strip() or "Unknown"
     subtitle = f"{tier_label} | {points if points is not None else '-'} pts"
+    task_description = (task.task_description or "").strip() or "No description available."
+    boss_url = (task.npc_url or "").strip() or None
+    task_url = (task.task_url or "").strip() or None
     payload: dict[str, Any] = {
         "task_id": int(task.task_id),
         "tier": tier_label.casefold(),
@@ -46,9 +49,12 @@ def task_payload(task: RandomTaskResult, *, rerolls_remaining: int | None = None
         "points": points,
         "npc": task.npc,
         "task_type": task.task_type,
-        "description": subtitle,
+        "description": task_description,
+        "task_description": task_description,
         "subtitle": subtitle,
-        "npc_url": task.npc_url,
+        "npc_url": boss_url,
+        "boss_url": boss_url,
+        "task_url": task_url,
     }
     if rerolls_remaining is not None:
         payload["rerolls_remaining"] = max(int(rerolls_remaining), 0)
@@ -60,6 +66,7 @@ def _task_from_metadata_row(row: Mapping[str, object]) -> RandomTaskResult:
     return RandomTaskResult(
         task_id=int(row.get("task_id") or 0),
         task_name=str(row.get("task_name") or "").strip() or "Unknown Task",
+        task_url=str(row.get("task_url") or "").strip() or None,
         task_description=str(row.get("description") or "").strip() or None,
         npc=str(row.get("npc") or "").strip() or None,
         npc_url=str(row.get("npc_url") or "").strip() or None,
@@ -71,14 +78,25 @@ def _task_from_metadata_row(row: Mapping[str, object]) -> RandomTaskResult:
     )
 
 
-def build_task_reel(sync_service: "SyncService", final_task: RandomTaskResult) -> tuple[list[dict[str, Any]], int]:
+def build_task_reel(
+    sync_service: "SyncService",
+    final_task: RandomTaskResult,
+    *,
+    candidate_task_ids: Sequence[int] | None = None,
+) -> tuple[list[dict[str, Any]], int]:
     with sync_service.db.connection() as conn:
-        catalog_ids = sync_service.db.get_catalog_task_ids(conn)
-        if not catalog_ids:
+        if candidate_task_ids is None:
+            reel_pool_ids = sync_service.db.get_catalog_task_ids(conn)
+        else:
+            reel_pool_ids = [int(task_id) for task_id in candidate_task_ids if int(task_id) > 0]
+        if final_task.task_id > 0 and final_task.task_id not in reel_pool_ids:
+            reel_pool_ids.append(int(final_task.task_id))
+
+        if not reel_pool_ids:
             filler = [task_payload(final_task) for _ in range(TASK_REEL_LENGTH)]
             return filler, min(TASK_REEL_STOP_INDEX, len(filler) - 1)
 
-        sampled_ids = [_RAND.choice(catalog_ids) for _ in range(TASK_REEL_LENGTH)]
+        sampled_ids = [_RAND.choice(reel_pool_ids) for _ in range(TASK_REEL_LENGTH)]
         stop_index = min(TASK_REEL_STOP_INDEX, TASK_REEL_LENGTH - 1)
         sampled_ids[stop_index] = int(final_task.task_id)
         metadata = sync_service.db.get_task_metadata_for_ids(conn, sorted(set(sampled_ids)))

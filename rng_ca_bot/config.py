@@ -36,6 +36,7 @@ class Settings:
     tier_assignment_weights: dict[str, int]
     reward_keys_require_verification: bool
     reward_admin_api_key: str | None
+    reward_web_url: str
     task_roll_web_url: str
 
     @property
@@ -132,5 +133,6 @@ def load_settings() -> Settings:
         tier_assignment_weights=_parse_tier_assignment_weights(os.getenv("TIER_ASSIGNMENT_WEIGHTS")),
         reward_keys_require_verification=_get_bool("REWARD_KEYS_REQUIRE_VERIFICATION", True),
         reward_admin_api_key=os.getenv("REWARD_ADMIN_API_KEY", "").strip() or None,
+        reward_web_url=os.getenv("REWARD_WEB_URL", "http://localhost:5173/").strip(),
         task_roll_web_url=os.getenv("TASK_ROLL_WEB_URL", "http://localhost:5173/?mode=task").strip(),
     )

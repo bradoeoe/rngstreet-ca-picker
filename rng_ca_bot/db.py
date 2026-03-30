@@ -49,6 +49,7 @@ PREFIX_RENAMES: tuple[tuple[str, str], ...] = (
 class TaskCatalogEntry:
     task_id: int
     task_name: str
+    task_url: str | None
     description: str | None
     npc: str | None
     npc_url: str | None
@@ -358,6 +359,7 @@ class Database:
             (
                 entry.task_id,
                 entry.task_name,
+                entry.task_url,
                 entry.description,
                 entry.npc,
                 entry.npc_url,
@@ -376,6 +378,7 @@ class Database:
             INSERT INTO {TASK_CATALOG_TABLE} (
                 task_id,
                 task_name,
+                task_url,
                 description,
                 npc,
                 npc_url,
@@ -385,9 +388,10 @@ class Database:
                 points,
                 source_url
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
                 task_name = VALUES(task_name),
+                task_url = VALUES(task_url),
                 description = VALUES(description),
                 npc = VALUES(npc),
                 npc_url = VALUES(npc_url),
@@ -413,6 +417,7 @@ class Database:
             SELECT
                 task_id,
                 task_name,
+                task_url,
                 description,
                 npc,
                 npc_url,
@@ -437,6 +442,7 @@ class Database:
             SELECT
                 task_id,
                 task_name,
+                task_url,
                 description,
                 npc,
                 npc_url,
@@ -1026,6 +1032,26 @@ class Database:
         cursor.execute(query, (discord_user_id, rsn, int(task_id)))
         return cursor.fetchone()
 
+    def list_reward_task_ids_for_user_rsn(
+        self,
+        conn: MySQLConnection,
+        discord_user_id: str,
+        rsn: str,
+        *,
+        for_update: bool = False,
+    ) -> list[int]:
+        cursor = conn.cursor()
+        query = f"""
+            SELECT task_id
+            FROM {REWARDS_TABLE}
+            WHERE discord_user_id = %s
+              AND rsn = %s
+        """
+        if for_update:
+            query += " FOR UPDATE"
+        cursor.execute(query, (discord_user_id, rsn))
+        return [int(row[0]) for row in cursor.fetchall()]
+
     def ensure_reward_for_claim(
         self,
         conn: MySQLConnection,
@@ -1103,6 +1129,32 @@ class Database:
         else:
             raise ValueError(f"Unsupported reward status: {status}")
         return self.get_reward_for_claim(conn, discord_user_id, rsn, task_id)
+
+    def set_reward_ready_by_key(
+        self,
+        conn: MySQLConnection,
+        reward_key: str,
+    ) -> dict | None:
+        reward = self.get_reward_by_key(conn, reward_key, for_update=True)
+        if reward is None:
+            return None
+
+        current_status = str(reward.get("status") or "").strip().casefold()
+        if current_status == "redeemed":
+            return reward
+
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            UPDATE {REWARDS_TABLE}
+            SET status = 'ready',
+                verified_at = COALESCE(verified_at, CURRENT_TIMESTAMP)
+            WHERE id = %s
+              AND status IN ('pending_verification', 'ready', 'cancelled')
+            """,
+            (int(reward["id"]),),
+        )
+        return self.get_reward_by_key(conn, reward_key, for_update=True)
 
     def sync_reward_statuses_for_rsn(self, conn: MySQLConnection, rsn: str) -> tuple[int, int]:
         cursor = conn.cursor()
@@ -1335,6 +1387,10 @@ class Database:
                     task_id,
                     status,
                     payout_status,
+                    reward_kind,
+                    reward_label,
+                    reward_amount,
+                    reward_quantity,
                     created_at,
                     verified_at,
                     used_at,

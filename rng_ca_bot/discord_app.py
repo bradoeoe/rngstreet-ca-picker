@@ -36,6 +36,7 @@ LOGGER = logging.getLogger(__name__)
 PANEL_KEY = "global_task_panel"
 HIGHSCORES_PANEL_KEY = "global_highscores_panel"
 GET_TASK_CUSTOM_ID = "rngca:panel:get_task"
+GET_FUN_TASK_CUSTOM_ID = "rngca:panel:get_fun_task"
 REROLL_CUSTOM_ID = "rngca:panel:reroll"
 COMPLETE_TASK_CUSTOM_ID = "rngca:panel:complete_task"
 PROFILE_CUSTOM_ID = "rngca:panel:profile"
@@ -45,6 +46,7 @@ ALL_TIME_HIGHSCORES_CUSTOM_ID = "rngca:highscores:all_time"
 OVERALL_TIER_LEADERS_CUSTOM_ID = "rngca:highscores:tier_leaders"
 ADMIN_SET_REROLLS_CUSTOM_ID = "rngca:admin:set_rerolls"
 ADMIN_ADD_REROLLS_CUSTOM_ID = "rngca:admin:add_rerolls"
+ADMIN_GIVE_REWARD_KEY_CUSTOM_ID = "rngca:admin:give_reward_key"
 ADMIN_RESET_PENDING_CUSTOM_ID = "rngca:admin:reset_pending"
 ADMIN_CLEAR_ACTIVE_CUSTOM_ID = "rngca:admin:clear_active"
 ADMIN_PAYOUTS_CUSTOM_ID = "rngca:admin:payouts"
@@ -54,6 +56,7 @@ PAYOUTS_MARK_PAID_CUSTOM_ID = "rngca:payouts:mark_paid"
 PAYOUTS_UNDO_PAID_CUSTOM_ID = "rngca:payouts:undo_paid"
 
 ACTION_GET = "get_task"
+ACTION_FUN = "get_fun_task"
 ACTION_REROLL = "reroll"
 ACTION_COMPLETE = "complete_task"
 ACTION_PROFILE = "profile"
@@ -67,6 +70,8 @@ PROFILE_ICON_IMAGE_URL = (
     "Vampyric_slayer_helmet_detail.png"
 )
 PROFILE_BANNER_IMAGE_URL = "https://cdn.displate.com/artwork/1200x857/2025-11-25/c22bef74-5c80-4c40-a08b-f6721a207f6a.jpg"
+PANEL_ICON_IMAGE_URL = "https://oldschool.runescape.wiki/images/Tzkal_slayer_helmet_chathead.png"
+PANEL_BANNER_IMAGE_URL = "https://i.redd.it/vobh86y0aopz.jpg"
 HIGHSCORES_ICON_IMAGE_URL = "https://oldschool.runescape.wiki/images/Ghommal%27s_lucky_penny_detail.png?75281"
 HIGHSCORES_BANNER_IMAGE_URL = (
     "https://www.reddit.com/media?url=https%3A%2F%2Fpreview.redd.it%2F"
@@ -110,6 +115,13 @@ def _task_roll_mode_label(mode: str) -> str:
     return "New task"
 
 
+def _wiki_sync_incomplete_message(rsn: str) -> str:
+    return (
+        f"You haven't completed your task yet for *{rsn}*, "
+        "if you have completed this task, make sure you open runelite with the WikiSync plugin running."
+    )
+
+
 def _build_task_roll_url(base_url: str, *, issued: TaskRollKeyIssue) -> str:
     fallback = "http://localhost:5173/?mode=task"
     candidate = (base_url or "").strip() or fallback
@@ -124,6 +136,23 @@ def _build_task_roll_url(base_url: str, *, issued: TaskRollKeyIssue) -> str:
     query: dict[str, str] = {key: value for key, value in query_pairs}
     query["mode"] = "task"
     query["task_roll_key"] = issued.roll_key
+    encoded_query = urlencode(query)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, encoded_query, parsed.fragment))
+
+
+def _build_reward_roll_url(base_url: str, *, reward_key: str) -> str:
+    fallback = "http://localhost:5173/"
+    candidate = (base_url or "").strip() or fallback
+    try:
+        parsed = urlsplit(candidate)
+        if not parsed.scheme or not parsed.netloc:
+            raise ValueError("Reward URL must include scheme and host")
+    except Exception:
+        parsed = urlsplit(fallback)
+
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=False)
+    query: dict[str, str] = {key: value for key, value in query_pairs}
+    query["reward_key"] = reward_key.strip().upper()
     encoded_query = urlencode(query)
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, encoded_query, parsed.fragment))
 
@@ -222,7 +251,7 @@ def _reward_status_label(status: str | None) -> str | None:
     if normalized == "ready":
         return "Ready to redeem"
     if normalized == "pending_verification":
-        return "Pending verification"
+        return "Verification required (WikiSync on PC)"
     if normalized == "redeemed":
         return "Redeemed"
     if normalized == "cancelled":
@@ -237,6 +266,7 @@ def _task_embed(
     rerolls_remaining: int | None = None,
     reward_key: str | None = None,
     reward_status: str | None = None,
+    reward_url: str | None = None,
 ) -> discord.Embed:
     embed = discord.Embed(
         title=task.task_name,
@@ -244,8 +274,6 @@ def _task_embed(
         color=_task_color(task.points, task.tier_label),
         timestamp=datetime.now(UTC),
     )
-    if task.npc_url:
-        embed.url = task.npc_url
     embed.add_field(name="Assigned", value=f"`{rsn}`", inline=True)
     embed.add_field(name="Tier", value=task.tier_label or "Unknown", inline=True)
     embed.add_field(name="Points", value=str(task.points) if task.points is not None else "-", inline=True)
@@ -256,12 +284,21 @@ def _task_embed(
     embed.add_field(
         name="Tasks Left",
         value=f"**{max(task.eligible_count, 0)}**",
-        inline=False,
+        inline=True,
     )
     if rerolls_remaining is not None:
         embed.add_field(name="Rerolls Remaining", value=f"**{max(int(rerolls_remaining), 0)}**", inline=True)
+    useful_links: list[str] = []
+    if task.npc_url:
+        useful_links.append(f"[Boss Wiki]({task.npc_url})")
+    if task.task_url:
+        useful_links.append(f"[Task Wiki]({task.task_url})")
+    if useful_links:
+        embed.add_field(name="Useful links", value="\n".join(useful_links), inline=True)
     if reward_key:
         embed.add_field(name="Reward Key", value=f"`{reward_key}`", inline=False)
+    if reward_url:
+        embed.add_field(name="Open Reward Case", value=f"[Click to Redeem]({reward_url})", inline=False)
     if reward_status:
         embed.add_field(name="Reward Status", value=_reward_status_label(reward_status) or reward_status, inline=True)
     if task.npc_image_url:
@@ -271,37 +308,44 @@ def _task_embed(
 
 
 def _panel_embed() -> discord.Embed:
+    summary_text = (
+        "- **Get Task**: standard CA task assignment\n"
+        "- **Task Choice**: reveal task now or open the fun roller link\n"
+        "- **Active task**: opens task card with **Reroll** + **Case Reroll**\n"
+        "- **Profile**: rerolls and linked-account progress"
+    )
     embed = discord.Embed(
-        title="RNG Street CA Challenge Board!",
-        description=(
-            "Take on randomly assigned Combat Achievements\n"
-            "across your all of your accounts.\n"
-            "Can you earn a spot on the leaderboards?\n"
-            "(Requires wikisync runelite plugin to work correctly)"
-        ),
+        title="RNG Street CA Challenge Board",
         color=discord.Color.from_rgb(232, 113, 38),
+        timestamp=datetime.now(UTC),
     )
     embed.add_field(
-        name="Your challenge",
+        name="Quick Guide",
+        value=summary_text,
+        inline=False,
+    )
+    embed.add_field(
+        name="Standard Flow",
         value=(
             "* Get a task\n"
+            "* Choose Reveal Task or Fun Task link\n"
             "* Complete it\n"
             "* Repeat"
         ),
         inline=True,
     )
     embed.add_field(
-        name="System",
+        name="Fun Flow",
         value=(
-            "* Multi-account support\n"
-            "* Limited rerolls\n"
-            "* Progress tracking\n"
+            "* Press **Get Task**\n"
+            "* Pick **Open Fun Task**\n"
+            "* Repeat"
         ),
         inline=True,
     )
-    embed.set_thumbnail(url="https://oldschool.runescape.wiki/images/Tzkal_slayer_helmet_chathead.png")
-    embed.set_image(url="https://i.redd.it/vobh86y0aopz.jpg")
-    embed.set_footer(text="RNG Street CA / PvM Challenge System")
+    embed.set_thumbnail(url=PANEL_ICON_IMAGE_URL)
+    embed.set_image(url=PANEL_BANNER_IMAGE_URL)
+    embed.set_footer(text="Requires WikiSync RuneLite plugin for live tracking")
     return embed
 
 
@@ -369,23 +413,39 @@ def _highscores_embed(
 
 
 def _payout_board_user_key(entry: RewardPayoutEntry) -> str:
-    user_id = (entry.discord_user_id or "").strip()
-    if user_id:
-        return user_id
+    user_ref = (entry.discord_user_id or "").strip()
+    if user_ref:
+        parsed_user_id = _parse_discord_user_id(user_ref)
+        if parsed_user_id:
+            return parsed_user_id
+        return user_ref
     rsn = (entry.rsn or "").strip()
     if rsn:
         return f"rsn:{rsn.casefold()}"
     return "unknown"
 
 
-def _payout_board_user_label(user_key: str, entries: Sequence[RewardPayoutEntry]) -> str:
+def _payout_board_user_label(
+    user_key: str,
+    entries: Sequence[RewardPayoutEntry],
+    *,
+    guild: discord.Guild | None = None,
+) -> str:
     if user_key.startswith("rsn:"):
         rsn = entries[0].rsn if entries else "Unknown RSN"
         return f"RSN {rsn}"
     if user_key.isdigit():
-        return f"Discord {user_key}"
+        mention = f"<@{user_key}>"
+        if guild is not None:
+            member = guild.get_member(int(user_key))
+            if member is not None:
+                return f"{member.display_name} ({mention})"
+        return mention
     if user_key == "unknown":
         return "Unknown User"
+    fallback_rsn = entries[0].rsn if entries else ""
+    if fallback_rsn:
+        return f"{user_key} ({fallback_rsn})"
     return user_key
 
 
@@ -406,7 +466,7 @@ def _payout_board_user_lines(entries: Sequence[RewardPayoutEntry], *, max_lines:
     return _truncate_text("\n".join(lines), 1016)
 
 
-def _reward_payouts_embed(summary: RewardPayoutSummary) -> discord.Embed:
+def _reward_payouts_embed(summary: RewardPayoutSummary, *, guild: discord.Guild | None = None) -> discord.Embed:
     has_unpaid = summary.unpaid_count > 0
     color = discord.Color.orange() if has_unpaid else discord.Color.green()
     embed = discord.Embed(
@@ -421,7 +481,7 @@ def _reward_payouts_embed(summary: RewardPayoutSummary) -> discord.Embed:
         grouped_by_user.setdefault(_payout_board_user_key(entry), []).append(entry)
 
     summary_lines = [
-        f"pending payout keys : {summary.unpaid_count}",
+        f"unpaid payout keys  : {summary.unpaid_count}",
         f"users waiting       : {len(grouped_by_user)}",
         f"paid payout keys    : {summary.paid_count}",
     ]
@@ -435,7 +495,7 @@ def _reward_payouts_embed(summary: RewardPayoutSummary) -> discord.Embed:
         max_user_fields = 9
         visible_users = ordered_users[:max_user_fields]
         for user_key, owed_entries in visible_users:
-            user_label = _truncate_text(_payout_board_user_label(user_key, owed_entries), 240)
+            user_label = _truncate_text(_payout_board_user_label(user_key, owed_entries, guild=guild), 240)
             embed.add_field(
                 name=f"{user_label} ({len(owed_entries)})",
                 value=f"```{_payout_board_user_lines(owed_entries)}```",
@@ -459,6 +519,8 @@ def _reward_payouts_embed(summary: RewardPayoutSummary) -> discord.Embed:
 def _action_human_name(action: str) -> str:
     if action == ACTION_GET:
         return "Get Task"
+    if action == ACTION_FUN:
+        return "Get Fun Task"
     if action == ACTION_REROLL:
         return "Reroll"
     if action == ACTION_COMPLETE:
@@ -537,21 +599,28 @@ def _profile_embed(profile: UserTaskProfileSummary) -> discord.Embed:
     return embed
 
 
-def _reward_key_bucket_lines(entries: Sequence[RewardKeyStatusEntry]) -> str:
+def _reward_key_bucket_lines(
+    entries: Sequence[RewardKeyStatusEntry],
+    *,
+    include_reward_value: bool = False,
+) -> str:
     if not entries:
         return "None"
     lines: list[str] = []
     for entry in entries:
         rsn_label = entry.rsn or "Unknown RSN"
         task_label = f"Task {entry.task_id}" if entry.task_id is not None else "Task -"
-        lines.append(f"`{entry.reward_key}` | {rsn_label} | {task_label}")
+        line = f"`{entry.reward_key}` | {rsn_label} | {task_label}"
+        if include_reward_value:
+            reward_label = entry.reward_display_value or "Reward -"
+            line = f"{line} | {reward_label}"
+        lines.append(line)
     return _truncate_text("\n".join(lines), 1024)
 
 
 def _profile_rewards_embed(summary: UserRewardKeySummary) -> discord.Embed:
     summary_lines = [
-        f"Pending reward keys : {summary.pending_count}",
-        f"Unused reward keys  : {summary.unused_count}",
+        f"Ready reward keys   : {summary.unused_count}",
         f"Unpaid reward keys  : {summary.unpaid_count}",
     ]
     embed = discord.Embed(
@@ -562,24 +631,50 @@ def _profile_rewards_embed(summary: UserRewardKeySummary) -> discord.Embed:
     )
     embed.add_field(name="Summary", value="```" + "\n".join(summary_lines) + "```", inline=False)
     embed.add_field(
-        name="Pending Reward Keys",
-        value=_reward_key_bucket_lines(summary.pending_entries),
-        inline=False,
-    )
-    embed.add_field(
-        name="Unused Reward Keys",
+        name="Ready Reward Keys",
         value=_reward_key_bucket_lines(summary.unused_entries),
         inline=False,
     )
     embed.add_field(
         name="Unpaid Reward Keys",
-        value=_reward_key_bucket_lines(summary.unpaid_entries),
+        value=_reward_key_bucket_lines(summary.unpaid_entries, include_reward_value=True),
         inline=False,
     )
     embed.set_thumbnail(url=PROFILE_ICON_IMAGE_URL)
     embed.set_image(url=REWARDS_BANNER_IMAGE_URL)
     embed.set_footer(text=f"Showing up to {summary.limit_per_bucket} keys per category")
     return embed
+
+
+def _fun_task_roll_embed(
+    *,
+    issued: TaskRollKeyIssue,
+    roll_url: str,
+) -> discord.Embed:
+    mode_label = _task_roll_mode_label(issued.roll_mode)
+    mode_note = "Uses your current active task as reroll source." if issued.roll_mode == "reroll" else "Assigns or reuses a task via web roller."
+    embed = discord.Embed(
+        title="Fun Task Key Ready",
+        description=(
+            f"Account: `{issued.rsn}`\n"
+            f"Mode: **{mode_label}**\n"
+            f"Key: `{issued.roll_key}`\n"
+            f"[Open Task Roller]({roll_url})"
+        ),
+        color=discord.Color.from_rgb(232, 113, 38),
+        timestamp=datetime.now(UTC),
+    )
+    embed.add_field(name="How This Key Works", value=mode_note, inline=False)
+    embed.set_thumbnail(url=PANEL_ICON_IMAGE_URL)
+    embed.set_image(url=PANEL_BANNER_IMAGE_URL)
+    embed.set_footer(text="Generate as many fun-task keys as you want")
+    return embed
+
+
+def _fun_task_roll_link_view(roll_url: str) -> discord.ui.View:
+    link_view = discord.ui.View(timeout=300)
+    link_view.add_item(discord.ui.Button(label="Open Task Roller", style=discord.ButtonStyle.link, url=roll_url))
+    return link_view
 
 
 async def _send_ephemeral_followup(
@@ -620,11 +715,110 @@ def _active_task_message_payload(
         "view": AssignedTaskView(bot, owner_user_id=owner_user_id, rsn=rsn),
     }
 
+
+def _hidden_task_choice_embed(*, rsn: str, roll_url: str | None, reused_existing: bool = False) -> discord.Embed:
+    description_lines = [
+        f"Account: `{rsn}`",
+        "Task: ||??????????||",
+        "Status: existing active task found." if reused_existing else "Status: new task locked in.",
+        "",
+        "Choose one:",
+        "- Reveal the assigned task now",
+    ]
+    if roll_url:
+        description_lines.append("- Open the fun task roller link")
+    embed = discord.Embed(
+        title="Unknown Task",
+        description="\n".join(description_lines),
+        color=discord.Color.from_rgb(232, 113, 38),
+        timestamp=datetime.now(UTC),
+    )
+    embed.set_thumbnail(url=PANEL_ICON_IMAGE_URL)
+    embed.set_footer(text="Task hidden until you choose Reveal Task")
+    return embed
+
+
+class TaskRevealChoiceView(discord.ui.View):
+    def __init__(
+        self,
+        bot: "RngCABot",
+        *,
+        owner_user_id: str,
+        rsn: str,
+        assignment: ActiveTaskAssignment,
+        roll_url: str | None = None,
+    ) -> None:
+        super().__init__(timeout=600)
+        self.bot = bot
+        self.owner_user_id = owner_user_id
+        self.rsn = rsn
+        self.assignment = assignment
+        self.roll_url = (roll_url or "").strip() or None
+        if self.roll_url:
+            self.add_item(
+                discord.ui.Button(
+                    label="Open Fun Task",
+                    style=discord.ButtonStyle.link,
+                    url=self.roll_url,
+                    row=0,
+                )
+            )
+
+    async def _ensure_owner(self, interaction: discord.Interaction) -> bool:
+        if str(interaction.user.id) == self.owner_user_id:
+            return True
+        await interaction.response.send_message("This task choice belongs to another user.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Reveal Task", style=discord.ButtonStyle.primary, row=0)
+    async def reveal_task(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if not await self._ensure_owner(interaction):
+            return
+
+        assignment = self.assignment
+        if assignment is None:
+            _audit_log(interaction, "reveal_task_empty", rsn=self.rsn)
+            await interaction.response.edit_message(
+                content=f"No eligible tasks found for `{self.rsn}`.",
+                embed=None,
+                view=None,
+            )
+            return
+
+        _audit_log(
+            interaction,
+            "reveal_task_success",
+            rsn=assignment.rsn,
+            task_id=assignment.task.task_id,
+            task_name=assignment.task.task_name,
+            reused_existing=assignment.reused_existing,
+            tier=assignment.task.tier_label,
+            points=assignment.task.points,
+        )
+        reveal_message = None
+        if assignment.reused_existing:
+            reveal_message = (
+                f"`{assignment.rsn}` already has an active task. "
+                "Use **Complete Task**, **Reroll**, or **Case Reroll** below."
+            )
+        await interaction.response.edit_message(
+            **_active_task_message_payload(
+                self.bot,
+                owner_user_id=self.owner_user_id,
+                rsn=assignment.rsn,
+                task=assignment.task,
+                rerolls_remaining=assignment.rerolls_remaining,
+                content=reveal_message,
+            )
+        )
+
 async def _send_assignment_response(
     bot: "RngCABot",
     interaction: discord.Interaction,
     owner_user_id: str,
     assignment: ActiveTaskAssignment,
+    *,
+    content: str | None = None,
 ) -> None:
     await _send_ephemeral_followup(
         interaction,
@@ -634,6 +828,7 @@ async def _send_assignment_response(
             rsn=assignment.rsn,
             task=assignment.task,
             rerolls_remaining=assignment.rerolls_remaining,
+            content=content,
         ),
     )
 
@@ -677,7 +872,128 @@ async def _run_panel_action(
             tier=assignment.task.tier_label,
             points=assignment.task.points,
         )
-        await _send_assignment_response(bot, interaction, discord_user_id, assignment)
+        if assignment.reused_existing:
+            await _send_assignment_response(
+                bot,
+                interaction,
+                discord_user_id,
+                assignment,
+                content=(
+                    f"`{assignment.rsn}` already has an active task. "
+                    "Use **Complete Task**, **Reroll**, or **Case Reroll** below."
+                ),
+            )
+            return
+
+        roll_url: str | None = None
+        try:
+            issued = await asyncio.to_thread(
+                bot.services.sync_service.issue_task_roll_key,
+                discord_user_id,
+                rsn=assignment.rsn,
+                roll_mode="new",
+            )
+            if issued is not None:
+                roll_url = _build_task_roll_url(bot.settings.task_roll_web_url, issued=issued)
+                _audit_log(
+                    interaction,
+                    "get_task_choice_key_issued",
+                    rsn=issued.rsn,
+                    mode=issued.roll_mode,
+                    key=_compact_reward_key(issued.roll_key),
+                )
+            else:
+                _audit_log(interaction, "get_task_choice_key_empty", rsn=assignment.rsn)
+        except Exception:
+            LOGGER.exception("Could not issue task-choice key for user %s rsn %s", discord_user_id, assignment.rsn)
+            _audit_log(interaction, "get_task_choice_key_error", rsn=assignment.rsn)
+
+        await _send_ephemeral_followup(
+            interaction,
+            embed=_hidden_task_choice_embed(
+                rsn=assignment.rsn,
+                roll_url=roll_url,
+                reused_existing=assignment.reused_existing,
+            ),
+            view=TaskRevealChoiceView(
+                bot,
+                owner_user_id=discord_user_id,
+                rsn=assignment.rsn,
+                assignment=assignment,
+                roll_url=roll_url,
+            ),
+        )
+        return
+
+    if action == ACTION_FUN:
+        try:
+            has_active = await asyncio.to_thread(
+                bot.services.sync_service.has_active_incomplete_task,
+                discord_user_id,
+                rsn,
+            )
+            if has_active:
+                assignment = await asyncio.to_thread(
+                    bot.services.sync_service.get_or_assign_active_task,
+                    discord_user_id,
+                    rsn,
+                )
+                if assignment is not None:
+                    _audit_log(
+                        interaction,
+                        "get_fun_task_existing_active",
+                        rsn=assignment.rsn,
+                        task_id=assignment.task.task_id,
+                        task_name=assignment.task.task_name,
+                    )
+                    await _send_assignment_response(
+                        bot,
+                        interaction,
+                        discord_user_id,
+                        assignment,
+                        content=(
+                            f"`{assignment.rsn}` already has an active task. "
+                            "Use **Reroll** or **Case Reroll** below."
+                        ),
+                    )
+                    return
+
+            issued = await asyncio.to_thread(
+                bot.services.sync_service.issue_task_roll_key,
+                discord_user_id,
+                rsn=rsn,
+                roll_mode="new",
+            )
+        except Exception:
+            LOGGER.exception("Get Fun Task failed for user %s rsn %s", discord_user_id, rsn)
+            await _send_ephemeral_followup(
+                interaction,
+                content="Could not create a fun-task roll key right now. Please try again.",
+            )
+            return
+
+        if issued is None:
+            _audit_log(interaction, "get_fun_task_empty", rsn=rsn)
+            await _send_ephemeral_followup(
+                interaction,
+                content=f"Could not issue a fun-task key for `{rsn}` right now.",
+            )
+            return
+
+        roll_url = _build_task_roll_url(bot.settings.task_roll_web_url, issued=issued)
+        _audit_log(
+            interaction,
+            "get_fun_task_key_issued",
+            rsn=issued.rsn,
+            mode=issued.roll_mode,
+            key=_compact_reward_key(issued.roll_key),
+        )
+
+        await _send_ephemeral_followup(
+            interaction,
+            embed=_fun_task_roll_embed(issued=issued, roll_url=roll_url),
+            view=_fun_task_roll_link_view(roll_url),
+        )
         return
 
     if action == ACTION_COMPLETE:
@@ -709,6 +1025,21 @@ async def _run_panel_action(
             )
             return
 
+        if not completed.live_verified:
+            _audit_log(
+                interaction,
+                "complete_verification_required",
+                rsn=completed.rsn,
+                task_id=completed.task.task_id,
+                task_name=completed.task.task_name,
+                live_verification_attempted=completed.live_verification_attempted,
+            )
+            await _send_ephemeral_followup(
+                interaction,
+                content=_wiki_sync_incomplete_message(completed.rsn),
+            )
+            return
+
         asyncio.create_task(_refresh_highscores_panel(bot))
 
         _audit_log(
@@ -724,6 +1055,11 @@ async def _run_panel_action(
             awarded_rerolls=completed.awarded_rerolls,
             rerolls_remaining=completed.rerolls_remaining,
         )
+        reward_url = (
+            _build_reward_roll_url(bot.settings.reward_web_url, reward_key=completed.reward_key)
+            if completed.reward_key
+            else None
+        )
         await _send_ephemeral_followup(
             interaction,
             embed=_task_embed(
@@ -732,6 +1068,7 @@ async def _run_panel_action(
                 rerolls_remaining=completed.rerolls_remaining,
                 reward_key=completed.reward_key,
                 reward_status=completed.reward_status,
+                reward_url=reward_url,
             ),
         )
         return
@@ -858,8 +1195,8 @@ def _load_reward_payout_summary(bot: "RngCABot") -> RewardPayoutSummary:
 def _admin_panel_embed(default_target_user_id: str | None = None) -> discord.Embed:
     target_hint = default_target_user_id or "(enter per action)"
     embed = discord.Embed(
-        title="Admin Controls (v1)",
-        description="Moderator tools for rerolls and task-state cleanup.",
+        title="Mod Tools",
+        description="Moderator tools for rerolls, rewards, and task-state cleanup.",
         color=discord.Color.orange(),
         timestamp=datetime.now(UTC),
     )
@@ -868,9 +1205,9 @@ def _admin_panel_embed(default_target_user_id: str | None = None) -> discord.Emb
         value=(
             "`Set Rerolls` - set exact reroll count for one user\n"
             "`Add Rerolls` - add or subtract rerolls\n"
-            "`Reset Pending` - reset ALL claimed-unverified tasks\n"
+            "`Give Reward Key` - issue one or more reward keys for one user/RSN\n"
             "`Clear Active Task` - remove current assigned task(s)\n"
-            "`Payout Board` - open pending payouts in admin\n"
+            "`Payout Board` - open unpaid payouts in admin\n"
             "`Refresh Panels` - refresh task + highscores boards"
         ),
         inline=False,
@@ -880,7 +1217,7 @@ def _admin_panel_embed(default_target_user_id: str | None = None) -> discord.Emb
         value=f"`{target_hint}`",
         inline=False,
     )
-    embed.set_footer(text="Requires Kick Members permission")
+    embed.set_footer(text="Mod tools")
     return embed
 
 
@@ -908,7 +1245,7 @@ async def _open_admin_payout_board(
         has_unpaid=summary.unpaid_count > 0,
         has_paid=summary.paid_count > 0,
     )
-    embed = _reward_payouts_embed(summary)
+    embed = _reward_payouts_embed(summary, guild=interaction.guild)
 
     if edit_existing:
         if interaction.response.is_done():
@@ -1043,7 +1380,6 @@ class ProfileActionsView(discord.ui.View):
         _audit_log(
             interaction,
             "profile_rewards_view",
-            pending_count=summary.pending_count,
             unused_count=summary.unused_count,
             unpaid_count=summary.unpaid_count,
         )
@@ -1104,7 +1440,7 @@ class AssignedTaskView(discord.ui.View):
         await interaction.response.send_message("This task card belongs to another user.", ephemeral=True)
         return False
 
-    @discord.ui.button(label="Reroll", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Reroll", style=discord.ButtonStyle.secondary, row=0)
     async def reroll(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
         if not await self._ensure_owner(interaction):
             return
@@ -1175,7 +1511,48 @@ class AssignedTaskView(discord.ui.View):
             ),
         )
 
-    @discord.ui.button(label="Complete Task", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Case Reroll", style=discord.ButtonStyle.primary, row=0)
+    async def fun_reroll(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if not await self._ensure_owner(interaction):
+            return
+
+        try:
+            issued = await asyncio.to_thread(
+                self.bot.services.sync_service.issue_task_roll_key,
+                self.owner_user_id,
+                rsn=self.rsn,
+                roll_mode="reroll",
+            )
+        except Exception:
+            LOGGER.exception("Task card case reroll key issue failed for user %s rsn %s", self.owner_user_id, self.rsn)
+            await interaction.response.send_message(
+                "Could not create a case-reroll key right now. Please try again.",
+                ephemeral=True,
+            )
+            return
+
+        if issued is None:
+            await interaction.response.send_message(
+                f"Could not issue a case-reroll key for `{self.rsn}` right now.",
+                ephemeral=True,
+            )
+            return
+
+        roll_url = _build_task_roll_url(self.bot.settings.task_roll_web_url, issued=issued)
+        _audit_log(
+            interaction,
+            "task_card_fun_reroll_key_issued",
+            rsn=issued.rsn,
+            mode=issued.roll_mode,
+            key=_compact_reward_key(issued.roll_key),
+        )
+        await interaction.response.send_message(
+            embed=_fun_task_roll_embed(issued=issued, roll_url=roll_url),
+            view=_fun_task_roll_link_view(roll_url),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Complete Task", style=discord.ButtonStyle.success, row=0)
     async def complete_task(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
         if not await self._ensure_owner(interaction):
             return
@@ -1209,6 +1586,21 @@ class AssignedTaskView(discord.ui.View):
             )
             return
 
+        if not completed.live_verified:
+            _audit_log(
+                interaction,
+                "task_card_complete_verification_required",
+                rsn=completed.rsn,
+                task_id=completed.task.task_id,
+                task_name=completed.task.task_name,
+                live_verification_attempted=completed.live_verification_attempted,
+            )
+            await interaction.response.send_message(
+                _wiki_sync_incomplete_message(completed.rsn),
+                ephemeral=True,
+            )
+            return
+
         asyncio.create_task(_refresh_highscores_panel(self.bot))
 
         _audit_log(
@@ -1224,6 +1616,11 @@ class AssignedTaskView(discord.ui.View):
             awarded_rerolls=completed.awarded_rerolls,
             rerolls_remaining=completed.rerolls_remaining,
         )
+        reward_url = (
+            _build_reward_roll_url(self.bot.settings.reward_web_url, reward_key=completed.reward_key)
+            if completed.reward_key
+            else None
+        )
         await interaction.response.edit_message(
             content=None,
             embed=_task_embed(
@@ -1232,6 +1629,7 @@ class AssignedTaskView(discord.ui.View):
                 rerolls_remaining=completed.rerolls_remaining,
                 reward_key=completed.reward_key,
                 reward_status=completed.reward_status,
+                reward_url=reward_url,
             ),
             view=None,
         )
@@ -1674,6 +2072,169 @@ class AdminAddRerollsModal(_AdminActionModal):
         )
 
 
+class AdminGiveRewardKeyModal(_AdminActionModal):
+    def __init__(self, bot: "RngCABot", *, default_target_user_id: str | None = None) -> None:
+        super().__init__(
+            bot,
+            title="Give Reward Key",
+            default_target_user_id=default_target_user_id,
+        )
+        self.rsn_input = discord.ui.TextInput(
+            label="RSN",
+            placeholder="Exact RSN for this reward key",
+            required=True,
+            max_length=32,
+        )
+        self.task_id_input = discord.ui.TextInput(
+            label="Task ID (optional)",
+            placeholder="Leave blank to use active task ID for this RSN",
+            required=False,
+            max_length=10,
+        )
+        self.quantity_input = discord.ui.TextInput(
+            label="Quantity",
+            placeholder="1",
+            default="1",
+            required=True,
+            max_length=2,
+        )
+        self.add_item(self.rsn_input)
+        self.add_item(self.task_id_input)
+        self.add_item(self.quantity_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_kick_members_permission(interaction):
+            return
+
+        target_user_id = self._target_user_id()
+        if target_user_id is None:
+            await interaction.response.send_message(
+                "Provide a valid Discord user ID or mention for the target user.",
+                ephemeral=True,
+            )
+            return
+
+        rsn_value = _normalize_optional_rsn(str(self.rsn_input.value) or "")
+        if rsn_value is None:
+            await interaction.response.send_message("RSN is required.", ephemeral=True)
+            return
+
+        raw_task_id = str(self.task_id_input.value or "").strip()
+        task_id: int | None = None
+        if raw_task_id:
+            try:
+                task_id = int(raw_task_id)
+            except ValueError:
+                await interaction.response.send_message("Task ID must be a whole number.", ephemeral=True)
+                return
+            if task_id <= 0:
+                await interaction.response.send_message("Task ID must be a positive integer.", ephemeral=True)
+                return
+
+        try:
+            quantity = int(str(self.quantity_input.value or "").strip())
+        except ValueError:
+            await interaction.response.send_message("Quantity must be a whole number.", ephemeral=True)
+            return
+        if quantity <= 0:
+            await interaction.response.send_message("Quantity must be at least 1.", ephemeral=True)
+            return
+        if quantity > 25:
+            await interaction.response.send_message("Quantity cannot exceed 25.", ephemeral=True)
+            return
+
+        try:
+            issued_results = await asyncio.to_thread(
+                self.bot.services.sync_service.admin_issue_reward_key,
+                target_user_id,
+                rsn=rsn_value,
+                task_id=task_id,
+                quantity=quantity,
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        except Exception:
+            LOGGER.exception(
+                "Admin give reward key failed for target user %s rsn %s task_id %s quantity %s",
+                target_user_id,
+                rsn_value,
+                task_id,
+                quantity,
+            )
+            await interaction.response.send_message(
+                "Could not issue a reward key right now. Please try again.",
+                ephemeral=True,
+            )
+            return
+
+        if issued_results is None:
+            await interaction.response.send_message(
+                (
+                    f"No active task was found for `{rsn_value}`. "
+                    "Enter a Task ID to force a reward key for a specific task."
+                ),
+                ephemeral=True,
+            )
+            return
+
+        if not issued_results:
+            await interaction.response.send_message("No reward keys were issued.", ephemeral=True)
+            return
+
+        first_result = issued_results[0]
+        _audit_log(
+            interaction,
+            "admin_give_reward_key",
+            target_user_id=target_user_id,
+            rsn=first_result.rsn,
+            quantity_requested=quantity,
+            quantity_issued=len(issued_results),
+            reward_keys=", ".join(_compact_reward_key(entry.reward_key) for entry in issued_results),
+        )
+
+        if len(issued_results) == 1:
+            result = issued_results[0]
+            reward_url = _build_reward_roll_url(self.bot.settings.reward_web_url, reward_key=result.reward_key)
+            source_label = "active task" if result.used_active_task else f"task {result.task_id}"
+            status_label = _reward_status_label(result.reward_status) or result.reward_status
+            created_label = "new key" if result.created_new else "existing key"
+            if result.reward_status.strip().casefold() == "redeemed":
+                await interaction.response.send_message(
+                    (
+                        f"Found an existing redeemed reward key for <@{target_user_id}> `{result.rsn}` ({source_label}).\n"
+                        f"Key: `{result.reward_key}` ({created_label}, status: {status_label}).\n"
+                        "Use a different Task ID to issue another usable reward key."
+                    ),
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_message(
+                (
+                    f"Issued reward key for <@{target_user_id}> `{result.rsn}` ({source_label}).\n"
+                    f"Key: `{result.reward_key}` ({created_label}, status: {status_label}).\n"
+                    f"Redeem link: {reward_url}"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        summary_lines: list[str] = []
+        for entry in issued_results:
+            source_label = "active task" if entry.used_active_task else f"task {entry.task_id}"
+            status_label = _reward_status_label(entry.reward_status) or entry.reward_status
+            created_label = "new" if entry.created_new else "existing"
+            summary_lines.append(f"`{entry.reward_key}` - {source_label} - {created_label} - {status_label}")
+        details = _truncate_text("\n".join(summary_lines), 1400)
+        await interaction.response.send_message(
+            (
+                f"Issued **{len(issued_results)}** reward keys for <@{target_user_id}> `{first_result.rsn}`.\n"
+                f"{details}"
+            ),
+            ephemeral=True,
+        )
+
+
 class AdminClearActiveTaskModal(_AdminActionModal):
     def __init__(self, bot: "RngCABot", *, default_target_user_id: str | None = None) -> None:
         super().__init__(
@@ -1792,46 +2353,18 @@ class AdminPanelView(discord.ui.View):
         )
 
     @discord.ui.button(
-        label="Reset Pending",
-        style=discord.ButtonStyle.danger,
-        custom_id=ADMIN_RESET_PENDING_CUSTOM_ID,
-        row=1,
+        label="Give Reward Key",
+        style=discord.ButtonStyle.secondary,
+        custom_id=ADMIN_GIVE_REWARD_KEY_CUSTOM_ID,
+        row=0,
     )
-    async def reset_pending(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
-        if not await self._ensure_owner(interaction):
-            return
-        if not await _ensure_kick_members_permission(interaction):
-            return
-        await interaction.response.defer(ephemeral=True)
-        try:
-            result = await asyncio.to_thread(
-                self.bot.services.sync_service.admin_reset_pending_claims,
-            )
-        except Exception:
-            LOGGER.exception("Admin reset pending failed for global scope")
-            await interaction.followup.send(
-                "Could not reset pending tasks right now. Please try again.",
-                ephemeral=True,
-            )
-            return
-        touched_label = ", ".join(result.touched_rsns) if result.touched_rsns else "none"
-        touched_label = _truncate_text(touched_label, 700)
-        _audit_log(
+    async def give_reward_key(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        await self._open_modal(
             interaction,
-            "admin_reset_pending_all",
-            reset_claims=result.reset_claims,
-            ready_rewards_synced=result.ready_rewards_synced,
-            cancelled_rewards_synced=result.cancelled_rewards_synced,
-            touched_rsns=len(result.touched_rsns),
-        )
-        await interaction.followup.send(
-            (
-                f"Reset **{result.reset_claims}** pending task claim(s) across all users.\n"
-                f"RSNs touched: `{touched_label}`\n"
-                f"Reward sync: ready {result.ready_rewards_synced}, "
-                f"cancelled {result.cancelled_rewards_synced}."
+            AdminGiveRewardKeyModal(
+                self.bot,
+                default_target_user_id=self.default_target_user_id,
             ),
-            ephemeral=True,
         )
 
     @discord.ui.button(
@@ -2164,137 +2697,6 @@ class RngCABot(commands.Bot):
         self._highscores_listener_view = HighscoresPanelView(self)
 
     def _register_app_commands(self) -> None:
-        @self.tree.command(name="taskroll", description="Generate a web key to roll a task")
-        @app_commands.describe(
-            mode="Choose whether this key rolls a new task or rerolls your active task",
-            rsn="Optional RSN (required when your Discord maps to multiple accounts)",
-        )
-        @app_commands.choices(
-            mode=[
-                app_commands.Choice(name="New task", value="new"),
-                app_commands.Choice(name="Reroll active task", value="reroll"),
-            ]
-        )
-        async def task_roll(
-            interaction: discord.Interaction,
-            mode: app_commands.Choice[str],
-            rsn: str | None = None,
-        ) -> None:
-            ephemeral = interaction.guild_id is not None
-            await interaction.response.defer(ephemeral=ephemeral)
-
-            discord_user_id = str(interaction.user.id)
-            requested_rsn = _normalize_optional_rsn(rsn or "")
-            roll_mode = (mode.value if mode is not None else "new").strip().casefold()
-            if roll_mode not in {"new", "reroll"}:
-                await interaction.followup.send("Choose either `new` or `reroll` for mode.", ephemeral=ephemeral)
-                return
-
-            try:
-                rsns = await asyncio.to_thread(
-                    self.services.sync_service.resolve_rsns_for_discord_user,
-                    discord_user_id,
-                )
-            except Exception:
-                LOGGER.exception("Could not resolve RSNs for task roll user %s", discord_user_id)
-                await interaction.followup.send(
-                    "Could not resolve your RSN mapping right now. Please try again shortly.",
-                    ephemeral=ephemeral,
-                )
-                return
-
-            if not rsns:
-                await interaction.followup.send(
-                    (
-                        "No RSN mapping found for your Discord ID. "
-                        "Ask an admin to set your `members.DISCORD_ID` and `members.RSN` mapping."
-                    ),
-                    ephemeral=ephemeral,
-                )
-                return
-
-            chosen_rsn: str | None = None
-            if requested_rsn is None:
-                if len(rsns) == 1:
-                    chosen_rsn = rsns[0]
-                else:
-                    preview = ", ".join(f"`{value}`" for value in rsns[:10])
-                    hidden = len(rsns) - min(len(rsns), 10)
-                    extra = f" (+{hidden} more)" if hidden > 0 else ""
-                    await interaction.followup.send(
-                        (
-                            "You have multiple linked accounts. Run `/taskroll` again and set the `rsn` option.\n"
-                            f"Accounts: {preview}{extra}"
-                        ),
-                        ephemeral=ephemeral,
-                    )
-                    return
-            else:
-                chosen_rsn = next((value for value in rsns if value.casefold() == requested_rsn.casefold()), None)
-                if chosen_rsn is None:
-                    preview = ", ".join(f"`{value}`" for value in rsns[:10])
-                    hidden = len(rsns) - min(len(rsns), 10)
-                    extra = f" (+{hidden} more)" if hidden > 0 else ""
-                    await interaction.followup.send(
-                        f"`{requested_rsn}` is not linked to your Discord user. Linked accounts: {preview}{extra}",
-                        ephemeral=ephemeral,
-                    )
-                    return
-
-            try:
-                issued = await asyncio.to_thread(
-                    self.services.sync_service.issue_task_roll_key,
-                    discord_user_id,
-                    rsn=chosen_rsn,
-                    roll_mode=roll_mode,
-                )
-            except Exception:
-                LOGGER.exception(
-                    "Task roll key issuance failed for user %s rsn %s mode %s",
-                    discord_user_id,
-                    chosen_rsn,
-                    roll_mode,
-                )
-                await interaction.followup.send(
-                    "Could not create a task roll key right now. Please try again.",
-                    ephemeral=ephemeral,
-                )
-                return
-
-            if issued is None:
-                await interaction.followup.send(
-                    "Could not create a task roll key for that account.",
-                    ephemeral=ephemeral,
-                )
-                return
-
-            roll_url = _build_task_roll_url(self.settings.task_roll_web_url, issued=issued)
-            mode_label = _task_roll_mode_label(issued.roll_mode)
-
-            _audit_log(
-                interaction,
-                "task_roll_key_issued",
-                rsn=issued.rsn,
-                mode=issued.roll_mode,
-                key=_compact_reward_key(issued.roll_key),
-            )
-
-            embed = discord.Embed(
-                title="Task Roll Key Ready",
-                description=(
-                    f"Roll type: **{mode_label}**\n"
-                    f"Account: `{issued.rsn}`\n"
-                    f"Key: `{issued.roll_key}`\n"
-                    f"[Open Task Roller]({roll_url})"
-                ),
-                color=discord.Color.from_rgb(232, 113, 38),
-                timestamp=datetime.now(UTC),
-            )
-            embed.set_footer(text="Each key is single-use. Use /taskroll anytime for another key.")
-            link_view = discord.ui.View(timeout=300)
-            link_view.add_item(discord.ui.Button(label="Open Task Roller", style=discord.ButtonStyle.link, url=roll_url))
-            await interaction.followup.send(embed=embed, view=link_view, ephemeral=ephemeral)
-
         @self.tree.command(name="admin", description="Open moderator controls")
         @app_commands.guild_only()
         @app_commands.default_permissions(kick_members=True)

@@ -86,6 +86,7 @@ _BOSS_IMAGE_OVERRIDES: dict[str, str] = {
 class RandomTaskResult:
     task_id: int
     task_name: str
+    task_url: str | None
     task_description: str | None
     npc: str | None
     npc_url: str | None
@@ -256,6 +257,7 @@ class RewardKeyStatusEntry:
     reward_key: str
     rsn: str
     task_id: int | None
+    reward_display_value: str | None
     created_at: datetime | None
     verified_at: datetime | None
     used_at: datetime | None
@@ -296,6 +298,17 @@ class AdminActiveTaskClearResult:
     rsn: str | None
     cleared_tasks: int
     touched_rsns: list[str]
+
+
+@dataclass(slots=True)
+class AdminRewardKeyIssueResult:
+    discord_user_id: str
+    rsn: str
+    task_id: int
+    reward_key: str
+    reward_status: str
+    used_active_task: bool
+    created_new: bool
 
 
 class RuneLiteSyncError(Exception):
@@ -371,6 +384,7 @@ def parse_ca_task_catalog(html: str) -> list[TaskCatalogEntry]:
         npc_url = _extract_first_href(cells[0])
         npc_image_url = _infer_npc_image_url(npc_url, npc)
         task_name = _clean_html_text(cells[1]) or f"Task {task_id_raw}"
+        task_url = _extract_first_href(cells[1])
         task_description = _clean_html_text(cells[2]) or None
         task_type = _clean_html_text(cells[3]) or None
         tier_text = _clean_html_text(cells[4])
@@ -386,6 +400,7 @@ def parse_ca_task_catalog(html: str) -> list[TaskCatalogEntry]:
             TaskCatalogEntry(
                 task_id=int(task_id_raw),
                 task_name=task_name,
+                task_url=task_url,
                 description=task_description,
                 npc=npc,
                 npc_url=npc_url,
@@ -809,6 +824,7 @@ class SyncService:
 
             if metadata is None:
                 task_name = f"Task {task_id}"
+                task_url = None
                 task_description = None
                 npc = None
                 npc_url = None
@@ -818,6 +834,7 @@ class SyncService:
                 points = None
             else:
                 task_name = metadata.get("task_name") or f"Task {task_id}"
+                task_url = metadata.get("task_url")
                 task_description = metadata.get("description")
                 npc = metadata.get("npc")
                 npc_url = metadata.get("npc_url")
@@ -829,6 +846,7 @@ class SyncService:
             return RandomTaskResult(
                 task_id=task_id,
                 task_name=task_name,
+                task_url=task_url,
                 task_description=task_description,
                 npc=npc,
                 npc_url=npc_url,
@@ -843,6 +861,7 @@ class SyncService:
         metadata = self.db.get_task_metadata(conn, task_id)
         if metadata is None:
             task_name = f"Task {task_id}"
+            task_url = None
             task_description = None
             npc = None
             npc_url = None
@@ -852,6 +871,7 @@ class SyncService:
             points = None
         else:
             task_name = metadata.get("task_name") or f"Task {task_id}"
+            task_url = metadata.get("task_url")
             task_description = metadata.get("description")
             npc = metadata.get("npc")
             npc_url = metadata.get("npc_url")
@@ -863,6 +883,7 @@ class SyncService:
         return RandomTaskResult(
             task_id=task_id,
             task_name=task_name,
+            task_url=task_url,
             task_description=task_description,
             npc=npc,
             npc_url=npc_url,
@@ -921,6 +942,59 @@ class SyncService:
                 filtered.append(task_id)
 
         return filtered
+
+    def _compute_assignable_task_ids_with_conn(
+        self,
+        conn,
+        discord_user_id: str,
+        rsn: str,
+        *,
+        include_task_id: int | None = None,
+    ) -> list[int]:
+        latest_scan_id = self.db.get_latest_completed_scan_run_id(conn)
+        current_tier = self._get_current_tier_threshold(conn, rsn)
+        current_tier_rank = current_tier.rank if current_tier is not None else 0
+        incomplete_ids = self.db.get_incomplete_task_ids(conn, rsn)
+        claimed_ids = self.db.get_claimed_task_ids_for_scan(
+            conn,
+            discord_user_id=discord_user_id,
+            rsn=rsn,
+            scan_run_id=latest_scan_id,
+        )
+        assignable_ids = self._filter_assignable_task_ids(
+            conn,
+            compute_eligible_task_ids(incomplete_ids, claimed_ids),
+            incomplete_ids=incomplete_ids,
+            current_tier_rank=current_tier_rank,
+        )
+
+        if include_task_id is not None:
+            target_task_id = int(include_task_id)
+            if target_task_id not in assignable_ids:
+                metadata = self.db.get_task_metadata(conn, target_task_id)
+                if metadata is not None:
+                    assignable_ids.append(target_task_id)
+
+        return sorted({int(task_id) for task_id in assignable_ids})
+
+    def get_assignable_task_ids_for_user(
+        self,
+        discord_user_id: str,
+        rsn: str,
+        *,
+        include_task_id: int | None = None,
+    ) -> list[int]:
+        normalized_user_id = str(discord_user_id).strip()
+        normalized_rsn = str(rsn).strip()
+        if not normalized_user_id or not normalized_rsn:
+            return []
+        with self.db.connection() as conn:
+            return self._compute_assignable_task_ids_with_conn(
+                conn,
+                normalized_user_id,
+                normalized_rsn,
+                include_task_id=include_task_id,
+            )
 
     def _award_due_rerolls(self, conn, discord_user_id: str) -> tuple[int, int, int]:
         profile = self.db.get_user_task_profile(conn, discord_user_id, for_update=True)
@@ -1039,7 +1113,7 @@ class SyncService:
     def get_monthly_highscores_summary(self, limit: int | None = None) -> HighscoresSummary:
         start_at, end_at, month_label, reset_text = self._get_local_month_window()
         with self.db.connection() as conn:
-            rows = self.db.get_claim_leaderboard(
+            rows = self.db.get_verified_claim_leaderboard(
                 conn,
                 limit=limit if limit is None or limit > 0 else None,
                 start_at=start_at,
@@ -1051,8 +1125,8 @@ class SyncService:
                 rsn=str(row.get("rsn") or "").strip(),
                 verified_tasks=int(row.get("verified_tasks") or 0),
                 verified_points=int(row.get("verified_points") or 0),
-                pending_tasks=int(row.get("pending_tasks") or 0),
-                pending_points=int(row.get("pending_points") or 0),
+                pending_tasks=0,
+                pending_points=0,
             )
             for row in rows
             if str(row.get("rsn") or "").strip()
@@ -1062,29 +1136,26 @@ class SyncService:
                 rank=index,
                 rsn=entry.rsn,
                 headline=f"verified points : {entry.verified_points}",
-                detail=(
-                    f"verified tasks  : {entry.verified_tasks}\n"
-                    f"pending tasks   : {entry.pending_tasks} ({entry.pending_points} pts)"
-                ),
+                detail=f"verified tasks  : {entry.verified_tasks}",
             )
             for index, entry in enumerate(ranked_entries, start=1)
         ]
         return HighscoresSummary(
             title=f"Monthly Highscores - {month_label}",
-            description="Bot-assigned progress this month. Pending entries are claims waiting on verification.",
+            description="Bot-assigned progress this month (WikiSync verified only).",
             entries=entries,
-            empty_text="No verified or pending bot claims yet this month.",
+            empty_text="No verified bot claims yet this month.",
             reset_text=reset_text,
             total_verified_tasks=sum(entry.verified_tasks for entry in ranked_entries),
             total_verified_points=sum(entry.verified_points for entry in ranked_entries),
-            total_pending_tasks=sum(entry.pending_tasks for entry in ranked_entries),
-            total_pending_points=sum(entry.pending_points for entry in ranked_entries),
-            includes_pending=True,
+            total_pending_tasks=0,
+            total_pending_points=0,
+            includes_pending=False,
         )
 
     def get_all_time_highscores_summary(self, limit: int | None = None) -> HighscoresSummary:
         with self.db.connection() as conn:
-            rows = self.db.get_claim_leaderboard(
+            rows = self.db.get_verified_claim_leaderboard(
                 conn,
                 limit=limit if limit is None or limit > 0 else None,
             )
@@ -1094,8 +1165,8 @@ class SyncService:
                 rsn=str(row.get("rsn") or "").strip(),
                 verified_tasks=int(row.get("verified_tasks") or 0),
                 verified_points=int(row.get("verified_points") or 0),
-                pending_tasks=int(row.get("pending_tasks") or 0),
-                pending_points=int(row.get("pending_points") or 0),
+                pending_tasks=0,
+                pending_points=0,
             )
             for row in rows
             if str(row.get("rsn") or "").strip()
@@ -1105,23 +1176,20 @@ class SyncService:
                 rank=index,
                 rsn=entry.rsn,
                 headline=f"verified points : {entry.verified_points}",
-                detail=(
-                    f"verified tasks  : {entry.verified_tasks}\n"
-                    f"pending tasks   : {entry.pending_tasks} ({entry.pending_points} pts)"
-                ),
+                detail=f"verified tasks  : {entry.verified_tasks}",
             )
             for index, entry in enumerate(ranked_entries, start=1)
         ]
         return HighscoresSummary(
             title="All-Time Bot Highscores",
-            description="All-time bot-assigned progress. Pending entries are claims waiting on verification.",
+            description="All-time bot-assigned progress (WikiSync verified only).",
             entries=entries,
-            empty_text="No verified or pending bot claims have been recorded yet.",
+            empty_text="No verified bot claims have been recorded yet.",
             total_verified_tasks=sum(entry.verified_tasks for entry in ranked_entries),
             total_verified_points=sum(entry.verified_points for entry in ranked_entries),
-            total_pending_tasks=sum(entry.pending_tasks for entry in ranked_entries),
-            total_pending_points=sum(entry.pending_points for entry in ranked_entries),
-            includes_pending=True,
+            total_pending_tasks=0,
+            total_pending_points=0,
+            includes_pending=False,
         )
 
     def get_overall_tier_leaders_summary(self, limit: int | None = None) -> HighscoresSummary:
@@ -1220,10 +1288,36 @@ class SyncService:
 
     def _build_reward_key_status_entry(self, row: Mapping[str, object]) -> RewardKeyStatusEntry:
         task_id_raw = row.get("task_id")
+        reward_label = str(row.get("reward_label") or "").strip()
+        reward_kind = str(row.get("reward_kind") or "").strip().casefold()
+        amount_raw = row.get("reward_amount")
+        quantity_raw = row.get("reward_quantity")
+        reward_amount: int | None = None
+        reward_quantity: int | None = None
+        if amount_raw is not None:
+            try:
+                reward_amount = int(amount_raw)
+            except (TypeError, ValueError):
+                reward_amount = None
+        if quantity_raw is not None:
+            try:
+                reward_quantity = int(quantity_raw)
+            except (TypeError, ValueError):
+                reward_quantity = None
+        normalized_kind = reward_kind or ("gp" if reward_amount is not None else "item")
+        reward_display_value: str | None = None
+        if reward_label or reward_amount is not None or reward_quantity is not None:
+            reward_display_value = format_reward_display(
+                kind=normalized_kind,
+                label=reward_label,
+                amount=reward_amount,
+                quantity=reward_quantity,
+            )
         return RewardKeyStatusEntry(
             reward_key=str(row.get("reward_key") or "").strip(),
             rsn=str(row.get("rsn") or "").strip(),
             task_id=int(task_id_raw) if task_id_raw is not None else None,
+            reward_display_value=reward_display_value,
             created_at=row.get("created_at") if isinstance(row.get("created_at"), datetime) else None,
             verified_at=row.get("verified_at") if isinstance(row.get("verified_at"), datetime) else None,
             used_at=row.get("used_at") if isinstance(row.get("used_at"), datetime) else None,
@@ -1400,6 +1494,108 @@ class SyncService:
             touched_rsns=touched_rsns,
         )
 
+    def admin_issue_reward_key(
+        self,
+        discord_user_id: str,
+        *,
+        rsn: str,
+        task_id: int | None = None,
+        quantity: int = 1,
+    ) -> list[AdminRewardKeyIssueResult] | None:
+        normalized_user_id = str(discord_user_id).strip()
+        normalized_rsn = str(rsn or "").strip()
+        if not normalized_user_id or not normalized_rsn:
+            raise ValueError("Discord user ID and RSN are required")
+
+        requested_quantity = int(quantity)
+        if requested_quantity <= 0:
+            raise ValueError("Quantity must be at least 1.")
+        if requested_quantity > 25:
+            raise ValueError("Quantity cannot exceed 25.")
+
+        explicit_task_id = int(task_id) if task_id is not None else None
+        if explicit_task_id is not None and explicit_task_id <= 0:
+            raise ValueError("Task ID must be a positive integer")
+
+        with self.db.connection() as conn:
+            resolved_task_id: int | None = explicit_task_id
+            used_active_task = False
+            if resolved_task_id is None:
+                active = self.db.get_active_task(conn, normalized_user_id, normalized_rsn)
+                if active is None:
+                    return None
+                resolved_task_id = int(active["task_id"])
+                used_active_task = True
+
+            catalog_ids = self.db.get_catalog_task_ids(conn)
+            if not catalog_ids:
+                raise ValueError("Task catalog is empty; cannot issue reward keys.")
+            catalog_id_set = {int(task_catalog_id) for task_catalog_id in catalog_ids}
+            if int(resolved_task_id) not in catalog_id_set:
+                raise ValueError(f"Task ID {resolved_task_id} was not found in the task catalog.")
+
+            issued_task_ids: list[int] = [int(resolved_task_id)]
+            if requested_quantity > 1:
+                existing_task_ids = set(
+                    self.db.list_reward_task_ids_for_user_rsn(
+                        conn,
+                        normalized_user_id,
+                        normalized_rsn,
+                        for_update=True,
+                    )
+                )
+                existing_task_ids.add(int(resolved_task_id))
+                for candidate_task_id in catalog_ids:
+                    current_task_id = int(candidate_task_id)
+                    if current_task_id in existing_task_ids:
+                        continue
+                    issued_task_ids.append(current_task_id)
+                    existing_task_ids.add(current_task_id)
+                    if len(issued_task_ids) >= requested_quantity:
+                        break
+
+                if len(issued_task_ids) < requested_quantity:
+                    raise ValueError(
+                        (
+                            f"Only {len(issued_task_ids)} key(s) can be issued for `{normalized_rsn}` "
+                            "before task IDs start duplicating existing rewards."
+                        )
+                    )
+
+            issued_results: list[AdminRewardKeyIssueResult] = []
+            for current_task_id in issued_task_ids:
+                existing = self.db.get_reward_for_claim(
+                    conn,
+                    normalized_user_id,
+                    normalized_rsn,
+                    current_task_id,
+                    for_update=True,
+                )
+                created_new = existing is None
+                reward_row = self.db.ensure_reward_for_claim(
+                    conn,
+                    normalized_user_id,
+                    normalized_rsn,
+                    current_task_id,
+                )
+                reward_key = str(reward_row.get("reward_key") or "").strip()
+                ready_row = self.db.set_reward_ready_by_key(conn, reward_key) or reward_row
+                issued_results.append(
+                    AdminRewardKeyIssueResult(
+                        discord_user_id=normalized_user_id,
+                        rsn=normalized_rsn,
+                        task_id=int(current_task_id),
+                        reward_key=reward_key,
+                        reward_status=str(ready_row.get("status") or "").strip() or "ready",
+                        used_active_task=bool(used_active_task and int(current_task_id) == int(resolved_task_id)),
+                        created_new=created_new,
+                    )
+                )
+
+            conn.commit()
+
+        return issued_results
+
     def mark_reward_paid(
         self,
         reward_key: str,
@@ -1502,21 +1698,29 @@ class SyncService:
             created_at=created.get("created_at") if isinstance(created.get("created_at"), datetime) else None,
         )
 
-    def _task_from_task_roll_row(self, row: Mapping[str, object]) -> RandomTaskResult | None:
+    def _task_from_task_roll_row(self, row: Mapping[str, object], *, conn=None) -> RandomTaskResult | None:
         task_id_raw = row.get("result_task_id")
         if task_id_raw is None:
             return None
         task_name = str(row.get("result_task_name") or "").strip()
         if not task_name:
             return None
+        task_id = int(task_id_raw)
+        metadata = self.db.get_task_metadata(conn, task_id) if conn is not None else None
+        npc_value = str(row.get("result_npc") or "").strip() or None
+        task_url_value = str((metadata or {}).get("task_url") or "").strip() or None
+        npc_url_value = str((metadata or {}).get("npc_url") or "").strip() or None
+        task_type_value = str((metadata or {}).get("task_type") or "").strip() or None
+        task_description_value = str((metadata or {}).get("description") or "").strip() or None
         return RandomTaskResult(
-            task_id=int(task_id_raw),
+            task_id=task_id,
             task_name=task_name,
-            task_description=None,
-            npc=str(row.get("result_npc") or "").strip() or None,
-            npc_url=None,
+            task_url=task_url_value,
+            task_description=task_description_value,
+            npc=npc_value,
+            npc_url=npc_url_value,
             npc_image_url=str(row.get("result_npc_image_url") or "").strip() or None,
-            task_type=None,
+            task_type=task_type_value,
             tier_label=str(row.get("result_tier_label") or "").strip() or None,
             points=int(row.get("result_points") or 0) if row.get("result_points") is not None else None,
             eligible_count=0,
@@ -1559,7 +1763,7 @@ class SyncService:
             rsn = str(row.get("rsn") or "").strip()
 
             if status == "used":
-                task = self._task_from_task_roll_row(row)
+                task = self._task_from_task_roll_row(row, conn=conn)
                 conn.rollback()
                 return TaskRollRedeemResult(
                     status="used",
@@ -1637,7 +1841,7 @@ class SyncService:
                     conn,
                     discord_user_id,
                     rsn,
-                    consume_reroll=False,
+                    consume_reroll=True,
                 )
                 if reroll is None:
                     conn.rollback()
@@ -1654,6 +1858,18 @@ class SyncService:
                     )
                 if reroll.replacement_task is None:
                     conn.rollback()
+                    if reroll.rerolls_remaining <= 0:
+                        return TaskRollRedeemResult(
+                            status="no_rerolls",
+                            roll_key=normalized_key,
+                            discord_user_id=discord_user_id,
+                            rsn=rsn,
+                            roll_mode=roll_mode,
+                            task=reroll.previous_task,
+                            rerolls_remaining=0,
+                            used_at=None,
+                            message=f"You have no rerolls left for `{rsn}`.",
+                        )
                     return TaskRollRedeemResult(
                         status="no_alternative",
                         roll_key=normalized_key,
@@ -1706,7 +1922,7 @@ class SyncService:
                         discord_user_id=discord_user_id,
                         rsn=rsn,
                         roll_mode=roll_mode,
-                        task=self._task_from_task_roll_row(latest),
+                        task=self._task_from_task_roll_row(latest, conn=conn),
                         rerolls_remaining=(
                             int(latest.get("result_rerolls_remaining") or 0)
                             if latest.get("result_rerolls_remaining") is not None
@@ -1879,6 +2095,19 @@ class SyncService:
         with self.db.connection() as conn:
             return self.db.get_rsns_for_discord_user(conn, discord_user_id)
 
+    def has_active_incomplete_task(self, discord_user_id: str, rsn: str) -> bool:
+        normalized_user_id = str(discord_user_id).strip()
+        normalized_rsn = str(rsn).strip()
+        if not normalized_user_id or not normalized_rsn:
+            return False
+        with self.db.connection() as conn:
+            active = self.db.get_active_task(conn, normalized_user_id, normalized_rsn)
+            if active is None:
+                return False
+            task_id = int(active["task_id"])
+            completion_state = self.db.get_task_completion_state(conn, normalized_rsn, task_id)
+            return completion_state is False
+
     def get_user_task_profile_summary(self, discord_user_id: str) -> UserTaskProfileSummary:
         with self.db.connection() as conn:
             awarded_rerolls, _, _ = self._award_due_rerolls(conn, discord_user_id)
@@ -1999,121 +2228,26 @@ class SyncService:
         channel_id: str | None,
         message_id: str | None,
     ) -> CompletionResult | None:
-        task: RandomTaskResult
+        active_rsn: str
+        task_id: int
         reward_key: str | None = None
         reward_status: str | None = None
+        awarded_rerolls = 0
+
         with self.db.connection() as conn:
             active = self.db.get_active_task(conn, discord_user_id, rsn)
             if active is None:
                 return None
-
             active_rsn = str(active["rsn"]).strip()
             task_id = int(active["task_id"])
 
-            try:
-                latest_scan_id = self.db.get_latest_completed_scan_run_id(conn)
-                self.db.upsert_single_progress(
-                    conn,
-                    rsn=active_rsn,
-                    task_id=task_id,
-                    is_complete=True,
-                    source="claim",
-                    source_scan_run_id=latest_scan_id,
-                )
-                self.db.mark_task_claimed_complete(
-                    conn,
-                    discord_user_id=discord_user_id,
-                    rsn=active_rsn,
-                    task_id=task_id,
-                    claim_scan_run_id=latest_scan_id,
-                    guild_id=guild_id,
-                    channel_id=channel_id,
-                    message_id=message_id,
-                )
-                reward = self.db.ensure_reward_for_claim(conn, discord_user_id, active_rsn, task_id)
-                if not self.settings.reward_keys_require_verification:
-                    reward = self.db.update_reward_status_for_claim(
-                        conn,
-                        discord_user_id,
-                        active_rsn,
-                        task_id,
-                        status="ready",
-                    ) or reward
-                reward_key = str(reward.get("reward_key") or "").strip() or None
-                reward_status = str(reward.get("status") or "").strip() or None
-                self.db.clear_active_task(conn, discord_user_id, active_rsn)
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-
         live_verification_attempted = False
         live_verified = False
-        awarded_rerolls = 0
-
         try:
             payload = self.fetch_runelite_payload(active_rsn)
             live_verification_attempted = True
             completed_ids = extract_completed_ca_task_ids(payload)
-            if task_id in completed_ids:
-                with self.db.connection() as conn:
-                    try:
-                        latest_scan_id = self.db.get_latest_completed_scan_run_id(conn)
-                        self.db.upsert_single_progress(
-                            conn,
-                            rsn=active_rsn,
-                            task_id=task_id,
-                            is_complete=True,
-                            source="verify",
-                            source_scan_run_id=latest_scan_id,
-                        )
-                        previous_status, claim_status = self.db.mark_task_verified(
-                            conn,
-                            discord_user_id=discord_user_id,
-                            rsn=active_rsn,
-                            task_id=task_id,
-                            is_complete=True,
-                            verified_scan_run_id=latest_scan_id,
-                        )
-                        if claim_status == "verified_complete":
-                            reward = self.db.update_reward_status_for_claim(
-                                conn,
-                                discord_user_id,
-                                active_rsn,
-                                task_id,
-                                status="ready",
-                            )
-                            if reward is not None:
-                                reward_status = str(reward.get("status") or "").strip() or reward_status
-                        elif claim_status == "corrected_incomplete":
-                            reward = self.db.update_reward_status_for_claim(
-                                conn,
-                                discord_user_id,
-                                active_rsn,
-                                task_id,
-                                status="cancelled",
-                            )
-                            if reward is not None:
-                                reward_status = str(reward.get("status") or "").strip() or reward_status
-                        if claim_status == "verified_complete" and previous_status != "verified_complete":
-                            completion_bonus, _, _ = self._award_due_rerolls(conn, discord_user_id)
-                            boss_bonus = self._award_boss_completion_reroll_if_due(
-                                conn,
-                                discord_user_id=discord_user_id,
-                                rsn=active_rsn,
-                                task_id=task_id,
-                            )
-                            tier_bonus = self._award_tier_promotion_rerolls_if_due(
-                                conn,
-                                discord_user_id=discord_user_id,
-                                rsn=active_rsn,
-                            )
-                            awarded_rerolls = completion_bonus + boss_bonus + tier_bonus
-                        conn.commit()
-                        live_verified = True
-                    except Exception:
-                        conn.rollback()
-                        raise
+            live_verified = task_id in completed_ids
         except Exception:
             LOGGER.exception(
                 "Live verification failed for user %s rsn %s task %s",
@@ -2122,6 +2256,68 @@ class SyncService:
                 task_id,
             )
 
+        if live_verified:
+            with self.db.connection() as conn:
+                try:
+                    latest_scan_id = self.db.get_latest_completed_scan_run_id(conn)
+                    self.db.upsert_single_progress(
+                        conn,
+                        rsn=active_rsn,
+                        task_id=task_id,
+                        is_complete=True,
+                        source="verify",
+                        source_scan_run_id=latest_scan_id,
+                    )
+                    self.db.mark_task_claimed_complete(
+                        conn,
+                        discord_user_id=discord_user_id,
+                        rsn=active_rsn,
+                        task_id=task_id,
+                        claim_scan_run_id=latest_scan_id,
+                        guild_id=guild_id,
+                        channel_id=channel_id,
+                        message_id=message_id,
+                    )
+                    previous_status, claim_status = self.db.mark_task_verified(
+                        conn,
+                        discord_user_id=discord_user_id,
+                        rsn=active_rsn,
+                        task_id=task_id,
+                        is_complete=True,
+                        verified_scan_run_id=latest_scan_id,
+                    )
+                    reward = self.db.ensure_reward_for_claim(conn, discord_user_id, active_rsn, task_id)
+                    reward = self.db.update_reward_status_for_claim(
+                        conn,
+                        discord_user_id,
+                        active_rsn,
+                        task_id,
+                        status="ready",
+                    ) or reward
+                    reward_key = str(reward.get("reward_key") or "").strip() or None
+                    reward_status = str(reward.get("status") or "").strip() or None
+                    self.db.clear_active_task(conn, discord_user_id, active_rsn)
+
+                    if claim_status == "verified_complete" and previous_status != "verified_complete":
+                        completion_bonus, _, _ = self._award_due_rerolls(conn, discord_user_id)
+                        boss_bonus = self._award_boss_completion_reroll_if_due(
+                            conn,
+                            discord_user_id=discord_user_id,
+                            rsn=active_rsn,
+                            task_id=task_id,
+                        )
+                        tier_bonus = self._award_tier_promotion_rerolls_if_due(
+                            conn,
+                            discord_user_id=discord_user_id,
+                            rsn=active_rsn,
+                        )
+                        awarded_rerolls = completion_bonus + boss_bonus + tier_bonus
+
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+
         with self.db.connection() as conn:
             awarded_rerolls_snapshot, _, _ = self._award_due_rerolls(conn, discord_user_id)
             if awarded_rerolls_snapshot > 0:
@@ -2129,6 +2325,10 @@ class SyncService:
             rerolls_available, _reward_batches = self._get_user_profile_snapshot(conn, discord_user_id)
             verified_assigned_completions = self.db.count_verified_task_claims(conn, discord_user_id)
             remaining_count = self.db.get_progress_summary(conn, active_rsn)["incomplete_count"]
+            if not live_verified:
+                active = self.db.get_active_task(conn, discord_user_id, active_rsn)
+                if active is not None:
+                    task_id = int(active["task_id"])
             task = self._build_task_result(conn, task_id, remaining_count)
             reward = self.db.get_reward_for_claim(conn, discord_user_id, active_rsn, task_id)
             if reward is not None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Mapping
 
@@ -87,6 +87,43 @@ REWARD_POOL_BY_TIER: dict[str, tuple[RewardEntry, ...]] = {
     ),
 }
 
+DEFAULT_GP_IMAGE_URL = "https://oldschool.runescape.wiki/w/Special:FilePath/Coins_10000.png"
+REWARD_IMAGE_BY_LABEL: dict[str, str] = {
+    "cannonballs": "https://oldschool.runescape.wiki/w/Special:FilePath/Cannonball.png",
+    "dragon bones": "https://oldschool.runescape.wiki/w/Special:FilePath/Dragon_bones.png",
+    "rune platebody": "https://oldschool.runescape.wiki/w/Special:FilePath/Rune_platebody.png",
+    "dragon dagger(p++)": "https://oldschool.runescape.wiki/w/Special:FilePath/Dragon_dagger%28p++%29.png",
+    "abyssal whip": "https://oldschool.runescape.wiki/w/Special:FilePath/Abyssal_whip.png",
+    "dragon boots": "https://oldschool.runescape.wiki/w/Special:FilePath/Dragon_boots.png",
+    "amulet of fury": "https://oldschool.runescape.wiki/w/Special:FilePath/Amulet_of_fury.png",
+    "toxic blowpipe": "https://oldschool.runescape.wiki/w/Special:FilePath/Toxic_blowpipe.png",
+    "zenyte shard": "https://oldschool.runescape.wiki/w/Special:FilePath/Zenyte_shard.png",
+    "amulet of torture": "https://oldschool.runescape.wiki/w/Special:FilePath/Amulet_of_torture.png",
+    "pegasian crystal": "https://oldschool.runescape.wiki/w/Special:FilePath/Pegasian_crystal.png",
+    "bow of faerdhinen": "https://oldschool.runescape.wiki/w/Special:FilePath/Bow_of_faerdhinen.png",
+    "ancestral robe top": "https://oldschool.runescape.wiki/w/Special:FilePath/Ancestral_robe_top.png",
+    "masori body": "https://oldschool.runescape.wiki/w/Special:FilePath/Masori_body_%28f%29.png",
+    "voidwaker": "https://oldschool.runescape.wiki/w/Special:FilePath/Voidwaker.png",
+    "twisted bow": "https://oldschool.runescape.wiki/w/Special:FilePath/Twisted_bow.png",
+    "tumeken's shadow": "https://oldschool.runescape.wiki/w/Special:FilePath/Tumeken%27s_shadow_%28uncharged%29.png",
+    "scythe of vitur": "https://oldschool.runescape.wiki/w/Special:FilePath/Scythe_of_vitur_%28uncharged%29.png",
+}
+
+
+def _reward_image_for(*, kind: str, label: str, image_url: str | None) -> str | None:
+    if image_url:
+        return image_url
+    if kind == "gp":
+        return DEFAULT_GP_IMAGE_URL
+    return REWARD_IMAGE_BY_LABEL.get(label.strip().casefold())
+
+
+def _entry_with_image(entry: RewardEntry) -> RewardEntry:
+    next_image = _reward_image_for(kind=entry.kind, label=entry.label, image_url=entry.image_url)
+    if next_image == entry.image_url:
+        return entry
+    return replace(entry, image_url=next_image)
+
 
 def format_gp(amount: int) -> str:
     if amount >= 1_000_000_000:
@@ -128,15 +165,15 @@ def _pick_reward_entry(tier_key: str) -> RewardEntry:
 
     total_weight = sum(max(int(entry.weight), 0) for entry in pool)
     if total_weight <= 0:
-        return pool[0]
+        return _entry_with_image(pool[0])
 
     target = _RAND.randint(1, total_weight)
     running_total = 0
     for entry in pool:
         running_total += max(int(entry.weight), 0)
         if target <= running_total:
-            return entry
-    return pool[-1]
+            return _entry_with_image(entry)
+    return _entry_with_image(pool[-1])
 
 
 def reward_payload(tier: RewardTier, entry: RewardEntry) -> dict[str, Any]:
@@ -153,7 +190,7 @@ def reward_payload(tier: RewardTier, entry: RewardEntry) -> dict[str, Any]:
         "label": entry.label,
         "amount": entry.amount,
         "quantity": entry.quantity,
-        "image_url": entry.image_url,
+        "image_url": _reward_image_for(kind=entry.kind, label=entry.label, image_url=entry.image_url),
         "display_value": display_value,
         "display_amount": display_value,
         "card_class": tier.card_class,
@@ -182,6 +219,7 @@ def _reward_payload_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
     quantity = row.get("reward_quantity")
     image_url = str(row.get("reward_image_url") or "").strip() or None
     kind = str(row.get("reward_kind") or "").strip().casefold() or ("gp" if amount else "item")
+    image_url = _reward_image_for(kind=kind, label=reward_label, image_url=image_url)
     display_value = format_reward_display(
         kind=kind,
         label=reward_label,
@@ -236,8 +274,8 @@ def redeem_reward_key_payload(db: Database, reward_key: str) -> tuple[int, dict[
                 return (
                     HTTPStatus.CONFLICT,
                     {
-                        "status": "pending",
-                        "message": "That reward key exists, but the task has not been verified yet.",
+                        "status": "verification_required",
+                        "message": "This key is locked until WikiSync verification is seen from your PC client.",
                         "reward_key": normalized_key,
                     },
                 )

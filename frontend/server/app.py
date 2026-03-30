@@ -110,7 +110,16 @@ def create_app() -> Flask:
         result = app.config["sync_service"].redeem_task_roll_key(task_roll_key)
 
         if result.status == "ok" and result.task is not None:
-            reel, selected_index = build_task_reel(app.config["sync_service"], result.task)
+            candidate_task_ids = app.config["sync_service"].get_assignable_task_ids_for_user(
+                result.discord_user_id,
+                result.rsn,
+                include_task_id=result.task.task_id,
+            )
+            reel, selected_index = build_task_reel(
+                app.config["sync_service"],
+                result.task,
+                candidate_task_ids=candidate_task_ids,
+            )
             return (
                 jsonify(
                     {
@@ -145,20 +154,19 @@ def create_app() -> Flask:
             "expired": 410,
             "no_active": 409,
             "no_alternative": 409,
+            "no_rerolls": 409,
             "no_task": 409,
         }.get(result.status, 400)
-        return (
-            jsonify(
-                {
-                    "status": result.status,
-                    "message": result.message,
-                    "task_roll_key": result.roll_key,
-                    "roll_mode": result.roll_mode,
-                    "rsn": result.rsn,
-                }
-            ),
-            status_code,
-        )
+        response_payload = {
+            "status": result.status,
+            "message": result.message,
+            "task_roll_key": result.roll_key,
+            "roll_mode": result.roll_mode,
+            "rsn": result.rsn,
+        }
+        if result.task is not None:
+            response_payload["task"] = task_payload(result.task, rerolls_remaining=result.rerolls_remaining)
+        return jsonify(response_payload), status_code
 
     @app.get("/api/admin/payouts")
     def api_admin_payouts():
